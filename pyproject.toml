@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "computer-use-windows"
+version = "0.1.0"
+description = "Windows desktop control over MCP — FastMCP server with pynput + Win32 API backend"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+authors = [{ name = "computer-use-windows contributors" }]
+keywords = ["mcp", "computer-use", "windows", "accessibility", "fastmcp"]
+classifiers = [
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "fastmcp>=2.0,<3.0",
+    "pynput>=1.7",
+    "pywin32>=306",
+    "Pillow>=10.0",
+    "uiautomation>=2.0",
+    "anyio>=4.0",
+    "websockets>=12.0",
+]
+
+[project.optional-dependencies]
+dev = ["black>=24", "ruff>=0.3", "pytest>=8", "pytest-asyncio>=0.23"]
+remote = ["websockets>=12.0"]
+
+[project.scripts]
+computer-use-windows = "computer_use_windows.cli:main"
+computer-use-windows-mcp = "computer_use_windows.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["computer_use_windows"]
