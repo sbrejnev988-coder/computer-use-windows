@@ -1,152 +1,227 @@
-<div align="center">
-  <h1>computer-use-windows 🖥️</h1>
-  <p><strong>Windows desktop control via MCP — native Win32 API backend</strong></p>
-  <p>
-    <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
-    <img src="https://img.shields.io/badge/Platform-Windows%2010%2B-blue" alt="Windows 10+">
-    <img src="https://img.shields.io/badge/Python-3.12%2B-green" alt="Python 3.12+">
-  </p>
-</div>
+# Computer Use Windows
 
-Адаптировано из [trycua/cua](https://github.com/trycua/cua) — Computer Use Agent. Это самостоятельный Python-пакет для локального Windows-управления через MCP (Model Context Protocol).
+> **Version 2.0.0** — CISA Red Team Audit: production-grade Windows desktop control MCP server.  
+> **57 MCP tools** — screenshots, mouse/keyboard, window management, UI Automation, files, registry, services, shell.  
+> **Native Win32 backend** — SendInput (Unicode), SetForegroundWindow+AttachThreadInput, uiautomation ControlPatterns, win32service.  
+> **Zero Node.js dependency** — pure Python (optional: uiautomation, websockets, pywin32), runs on Windows with Python 3.11+.
 
-## Что это
+---
 
-`computer-use-windows` — Python MCP-сервер для Windows desktop control:
-
-- **UI Automation** — чтение accessibility-дерева (`uiautomation`)
-- **Скриншоты** — DXGI Desktop Duplication + GDI `BitBlt` fallback
-- **Ввод** — `SendInput` API (клики, драг, скролл, клавиатура, Unicode-ввод)
-- **Окна** — `EnumWindows`, `SetForegroundWindow` через `pywin32`
-
-## Установка
+## Quick Start
 
 ```powershell
-# Требования: Python 3.12+, Windows 10+
+# Install
+powershell -ExecutionPolicy Bypass -File install.ps1
 
-pip install computer-use-windows
+# With UI Automation
+powershell -ExecutionPolicy Bypass -File install.ps1 -UIA
 
-# Проверить готовность
+# Run local MCP server
+computer-use-windows mcp
+
+# Run remote WebSocket server
+$env:COMPUTER_USE_WINDOWS_TOKEN = "your-secret-token"
+computer-use-windows remote --host 0.0.0.0 --port 8765
+
+# Diagnostics
 computer-use-windows doctor
 ```
 
-### Из исходников
+## Security Profiles
+
+Set `COMPUTER_USE_WINDOWS_PROFILE` to control tool access:
+
+| Profile | Access |
+|---------|--------|
+| `observe` | Screenshots, windows, processes, system info (read-only) |
+| `desktop` | Mouse, keyboard, UIA, window management, clipboard **(default)** |
+| `files` | File read/write/list within allowed directories |
+| `admin` | Shell, processes, registry, services |
+| `unsafe` | Full access — only when explicitly enabled |
 
 ```powershell
-git clone https://github.com/YOUR/cua-windows
-cd cua-windows
-pip install -e ".[dev,dxgi]"
-computer-use-windows doctor
+$env:COMPUTER_USE_WINDOWS_PROFILE = "desktop"  # default
 ```
 
-## Использование
+## Complete Tool Reference
 
-### CLI
+### Observation (8 tools)
+| Tool | Description |
+|------|-------------|
+| `computer_screenshot` | Full virtual desktop screenshot with frame_id metadata |
+| `computer_screenshot_region` | Capture region (x, y, width, height) |
+| `computer_screenshot_window` | Capture window by HWND |
+| `computer_get_screen_size` | Virtual desktop dimensions |
+| `computer_get_cursor_position` | Current cursor (x, y) |
+| `computer_system_info` | OS, platform, DPI, monitors, UIA availability |
+| `computer_get_file_permissions` | File owner/security descriptor info |
+| `computer_list_windows` | All visible windows with titles/classes |
 
-```powershell
-computer-use-windows mcp          # Запуск MCP-сервера (stdio)
-computer-use-windows doctor       # JSON отчёт о готовности
-computer-use-windows screenshot   # Скриншот → screenshot.png
-computer-use-windows windows       # Список видимых окон
-computer-use-windows apps          # UIA accessibility дерево
+### Mouse (10 tools)
+| Tool | Description |
+|------|-------------|
+| `computer_click` | Left/right/middle click at coordinates (frame-aware) |
+| `computer_double_click` | Double-click at coordinates |
+| `computer_move` | Move cursor |
+| `computer_drag` | Smooth drag with interpolated movement |
+| `computer_scroll` | Vertical + horizontal scroll |
+| `computer_mouse_down` | Press mouse button |
+| `computer_mouse_up` | Release mouse button |
+
+### Keyboard (5 tools)
+| Tool | Description |
+|------|-------------|
+| `computer_type` | Type text (Unicode: Cyrillic, emoji, any script) |
+| `computer_press_key` | Press single key (name or char) |
+| `computer_hotkey` | Key combination (Ctrl+C, Alt+Tab, etc.) |
+| `computer_key_down` | Hold key |
+| `computer_key_up` | Release key |
+
+### Window Management (8 tools)
+| Tool | Description |
+|------|-------------|
+| `computer_activate_window` | Activate + bring to foreground (AttachThreadInput fallback) |
+| `computer_get_current_window` | Foreground window info |
+| `computer_get_app_windows` | Find windows by app name |
+| `computer_resize_window` | Set window dimensions |
+| `computer_minimize_window` | Minimize |
+| `computer_maximize_window` | Maximize |
+| `computer_restore_window` | Restore from minimized |
+| `computer_close_window` | Send WM_CLOSE |
+
+### UI Automation (13 tools)
+| Tool | Description |
+|------|-------------|
+| `computer_accessibility_tree` | Legacy HWND tree (EnumChildWindows) |
+| `computer_find_element` | Find by title/class |
+| `computer_get_ui_tree` | **Full UIA tree** with element IDs, ControlTypes, names |
+| `computer_find_ui_elements` | Search by control_type, name, automation_id, class_name |
+| `computer_focus_ui_element` | Set focus on UIA element |
+| `computer_invoke_ui_element` | Click/invoke (InvokePattern) |
+| `computer_set_ui_value` | Set value (ValuePattern) |
+| `computer_toggle_ui_element` | Toggle checkbox/switch (TogglePattern) |
+| `computer_select_ui_element` | Select list item (SelectionItemPattern) |
+| `computer_expand_ui_element` | Expand tree node (ExpandCollapsePattern) |
+| `computer_scroll_ui_element_into_view` | Scroll element into view (ScrollItemPattern) |
+| `computer_wait_for_ui_element` | Poll until element appears |
+
+### Files (12 tools)
+| Tool | Description |
+|------|-------------|
+| `computer_file_read` | Read text file |
+| `computer_file_write` | Write text file |
+| `computer_file_read_bytes` | Read binary (offset + length) |
+| `computer_file_write_bytes` | Write binary (base64) |
+| `computer_file_exists` | Check file |
+| `computer_directory_exists` | Check directory |
+| `computer_list_dir` | List directory contents |
+| `computer_create_dir` | Create directory |
+| `computer_delete_file` | Delete file (admin profile) |
+| `computer_delete_dir` | Delete directory recursively (admin profile) |
+| `computer_get_file_size` | File size |
+| `computer_move_file` / `computer_copy_file` | Move/copy |
+
+### System & Admin (14 tools)
+| Tool | Description |
+|------|-------------|
+| `computer_run_command` | Shell command (30s timeout, 1MB output limit) |
+| `computer_launch` | Start application (args list, no shell injection) |
+| `computer_clipboard_get` / `computer_clipboard_set` | Clipboard read/write |
+| `computer_list_processes` | All processes (per-PID error handling) |
+| `computer_kill_process` | Terminate by PID |
+| `computer_registry_read` / `computer_registry_write` | Registry operations (all types) |
+| `computer_list_services` | Enumerate services |
+| `computer_service_status` / `service_start` / `service_stop` / `service_restart` | Service control (win32service) |
+
+## Architecture
+
+```
+computer_use_windows/
+├── __init__.py          # Package metadata, v2.0.0
+├── cli.py               # CLI: mcp, remote, doctor subcommands
+├── remote.py            # WebSocket remote server with token auth
+├── handlers/
+│   ├── __init__.py      # Platform detection, handler exports
+│   ├── base.py          # Abstract base classes (Automation, Accessibility, File, System)
+│   └── windows.py       # Win32 implementation (1293 lines)
+│       ├── SendInput    # Native input via ctypes (Unicode, virtual desktop)
+│       ├── DPI          # Per-Monitor V2 via SetProcessDpiAwarenessContext
+│       ├── UIA          # UI Automation via uiautomation library
+│       ├── Services     # win32service (not sc.exe)
+│       └── Registry     # All REG_ types supported
+└── server/
+    └── __init__.py      # FastMCP server with 57 tools, capability profiles, action lock
 ```
 
-### MCP (Claude Desktop)
+## Coordinate System (Frame-aware)
 
-Отредактируйте `%APPDATA%\Claude\claude_desktop_config.json`:
+Every screenshot returns a `frame_id` with geometry metadata:
 
 ```json
 {
-  "mcpServers": {
-    "computer-use-windows": {
-      "command": "computer-use-windows",
-      "args": ["mcp"]
-    }
-  }
+  "frame_id": "frm_a1b2c3d4:e5f6a7b8c9d0",
+  "left": -1920,
+  "top": 0,
+  "source_width": 5760,
+  "source_height": 2160,
+  "image_width": 1280,
+  "image_height": 480
 }
 ```
 
-### MCP (Hermes Agent)
-
-```bash
-hermes mcp add computer-use-windows --command computer-use-windows --args mcp
-hermes mcp test computer-use-windows
-```
-
-## MCP-инструменты
-
-| Инструмент | Описание |
-|------------|----------|
-| `doctor` | JSON readiness report |
-| `screenshot` | Захват экрана (PNG/JPEG, макс. 1920px/2MB) |
-| `list_windows` | Все видимые окна (title, HWND, PID, bounds) |
-| `focused_window` | Окно в фокусе |
-| `activate_window` | Активировать окно по HWND |
-| `get_app_state` | Скриншот + UIA-дерево |
-| `click` | Клик по координатам (x, y) |
-| `drag` | Драг от start до end |
-| `scroll` | Скролл в координатах |
-| `press_key` | Нажатия клавиш (`ctrl+c`, `alt+tab`, `enter`) |
-| `type_text` | Unicode-ввод текста |
-| `perform_action` | UIA-действие (Invoke, Toggle, ...) |
-| `set_value` | Установить значение (текст/слайдер) |
-
-## Архитектура
+Mouse actions accept `frame_id` for correct coordinate transformation:
 
 ```
-computer-use-windows/
-├── computer_use_windows/
-│   ├── __init__.py
-│   ├── cli.py              # CLI (mcp, doctor, screenshot, windows, apps)
-│   ├── core/__init__.py    # Типы: Bounds, WindowInfo, AccessibilityNode, etc.
-│   ├── interface/__init__.py  # WindowsInterface: Win32 API бэкенд
-│   └── server/__init__.py  # MCP-сервер (stdio)
-├── pyproject.toml
-├── README.md
-└── install.ps1
+computer_click(x=640, y=240, frame_id="frm_a1b2c3d4:...")
+  → physical click at (0, 1080) on center of left monitor
 ```
 
-### Технологический стек
+Expired frames (desktop/window geometry changed) are rejected.
 
-| Слой | Технология |
-|------|-----------|
-| Скриншоты | DXGI Desktop Duplication (`dxcam`) → GDI `BitBlt` |
-| Ввод мыши | `SendInput` + `SetCursorPos` |
-| Клавиатура | `SendInput` (KEYBDINPUT + KEYEVENTF_UNICODE) |
-| Окна | `EnumWindows`, `SetForegroundWindow` |
-| Accessibility | UIA COM (`uiautomation`) — всегда активно на Windows |
-| MCP транспорт | `mcp` library, stdio |
+## Environment Variables
 
-## Отличия от cua
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `COMPUTER_USE_WINDOWS_TOKEN` | — | Auth token for remote WebSocket mode |
+| `COMPUTER_USE_WINDOWS_PROFILE` | `desktop` | Capability profile (observe/desktop/files/admin/unsafe) |
 
-| | `cua` (trycua/cua) | `computer-use-windows` |
-|---|---|---|
-| **Архитектура** | Клиент-сервер через WebSocket | Локальный, прямой Win32 API |
-| **Установка** | Docker / Lume / облако | `pip install` |
-| **Зависимости** | `cua-core` + `cua-computer` + `cua-agent` | Только `pywin32` + `uiautomation` + `Pillow` |
-| **Скриншоты** | Через WebSocket API | Прямой DXGI/GDI |
-| **UIA** | Через WebSocket | Прямой COM |
-| **MCP** | `cua-mcp-server` (FastMCP) | Свой MCP-сервер (stdlib mcp) |
+## Installation Options
 
-## Безопасность
+```powershell
+# Minimal (screenshots + mouse + keyboard)
+pip install git+https://github.com/sbrejnev988-coder/computer-use-windows.git
+pip install pywin32 psutil
 
-- **Нет сети.** Бинарные данные не покидают машину. MCP через stdio.
-- **Локальный доступ.** `SendInput` требует интерактивный desktop.
-- **UIA всегда включён.** В отличие от Linux AT-SPI, Windows accessibility не требует настройки.
-- **Явные мутирующие тулы.** `click`, `drag`, `type_text` аннотированы как `destructive=true`.
+# With UI Automation (Chromium, Electron, WPF, UWP)
+pip install uiautomation
 
-## Troubleshooting
+# With remote server
+pip install websockets
 
-| Проблема | Решение |
-|----------|---------|
-| `pywin32` не установлен | `pip install pywin32` |
-| `uiautomation` не установлен | `pip install uiautomation` |
-| Скриншоты чёрные | Установите `dxcam`: `pip install dxcam` |
-| DXGI не работает | Автоматический fallback на GDI `BitBlt` |
-| `SendInput` игнорируется | Процесс должен быть на интерактивном desktop (не service) |
+# Dev install
+git clone https://github.com/sbrejnev988-coder/computer-use-windows.git
+cd computer-use-windows
+pip install -e ".[win32,uia,remote]"
+```
 
-## Лицензия
+## Known Limitations
 
-MIT — см. [LICENSE](LICENSE).
+- UIPI prevents SendInput to elevated (admin) processes
+- Lock screen and secure desktop are inaccessible
+- Remote mode requires network access and securely configured token
+- Service management requires appropriate privileges
 
-Адаптировано из [trycua/cua](https://github.com/trycua/cua) (MIT License).
+## License
+
+MIT — see [LICENSE](LICENSE)
+
+## Changelog
+
+### v2.0.0 — CISA Red Team Audit
+- **P0**: Remote imports fixed, async entry point, frame_id coords, activate_window, DPI V2, error propagation, doctor
+- **P1**: Native SendInput, UI Automation, action lock, drag interpolation, Unicode keyboard
+- **P2**: Capability profiles, win32service, secure remote, shell timeout, clipboard fix, registry types
+
+### v1.0.0 — Initial Release
+- 13 MCP tools: screenshots, pynput mouse/keyboard, basic window management
+- FastMCP server, Win32 API backend (pynput + pywin32)
