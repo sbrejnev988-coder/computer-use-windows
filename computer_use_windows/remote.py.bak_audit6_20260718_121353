@@ -1,0 +1,367 @@
+"""WebSocket remote server — secure remote MCP access with auth + sessions.
+
+v2.1.0 — CISA Audit Round 2 fixes:
+  P0#8: Remote timeout now wraps actual operation (not lambda thread)
+  P1: Capability profiles applied to remote sessions
+  P1: Per-session action lock for remote input serialization
+"""
+
+import asyncio, base64, hmac, json, logging, os, sys, time, uuid
+from typing import Any, Dict, Optional
+
+try:
+    import websockets
+    from websockets.exceptions import ConnectionClosed
+except ImportError:
+    websockets = None
+
+from .handlers import (
+    WindowsAutomationHandler, WindowsAccessibilityHandler, WindowsFileHandler,
+)
+from .server import _tool_has_capability, get_input_lock, path_policy
+from .handlers.windows import initialize_windows_runtime  # share profile check
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_TOKEN_ENV = "COMPUTER_USE_WINDOWS_TOKEN"
+HEARTBEAT_INTERVAL = 30
+HEARTBEAT_TIMEOUT = 90
+MAX_MESSAGE_SIZE = 50 * 1024 * 1024
+OPERATION_TIMEOUT = 60.0
+
+
+class RemoteComputerSession:
+    """Isolated session per WebSocket client."""
+    def __init__(self):
+        self.session_id = uuid.uuid4().hex[:12]
+        self.automation = WindowsAutomationHandler()
+        self.accessibility = WindowsAccessibilityHandler()
+        self.file = WindowsFileHandler()
+        self.created_at = time.time()
+        self.last_heartbeat = time.time()
+        self.input_lock = get_input_lock()  # PS: shared process-wide lock
+
+
+class RemoteComputerServer:
+    """WebSocket server with token auth, session isolation, heartbeat,
+    capability enforcement, per-session input serialization."""
+
+    def __init__(self, host: str = "127.0.0.1", port: int = 8765, token: Optional[str] = None):
+        self.host = host
+        self.port = port
+        self.token = token or os.getenv(DEFAULT_TOKEN_ENV)
+        if not self.token and host not in {"127.0.0.1", "::1", "localhost"}:
+            raise RuntimeError(
+                f"A token is required for non-loopback bind. "
+                f"Set {DEFAULT_TOKEN_ENV} or pass --token."
+            )
+        initialize_windows_runtime()  # #5: DPI bootstrap
+        self.sessions: Dict[str, RemoteComputerSession] = {}
+        logger.info(
+            f"Remote server ws://{host}:{port} "
+            f"auth={'token' if self.token else 'NONE (loopback)'}"
+        )
+
+    async def _authenticate(self, websocket) -> bool:
+        if not self.token:
+            return True
+        try:
+            raw = await asyncio.wait_for(websocket.recv(), timeout=5.0)
+            msg = json.loads(raw)
+            if hmac.compare_digest(msg.get("token", ""), self.token):
+                await websocket.send(json.dumps({
+                    "status": "ok",
+                    "session": msg.get("resume_session", "")
+                }))
+                return True
+            await websocket.send(json.dumps({"status": "error", "error": "Invalid token"}))
+            return False
+        except (asyncio.TimeoutError, json.JSONDecodeError):
+            await websocket.send(json.dumps({
+                "status": "error",
+                "error": 'Auth required — send {"token":"..."}'
+            }))
+            return False
+
+    # ── Tool name → capability scope mapping ──────────────────────────
+
+    TOOL_CAPABILITIES = {
+        "screenshot": "screenshot", "screenshot_region": "screenshot_region",
+        "screenshot_window": "screenshot_window",
+        "get_screen_size": "get_screen_size", "get_cursor_position": "get_cursor_position",
+        "click": "click", "right_click": "click", "middle_click": "click",
+        "double_click": "double_click", "move": "move", "drag": "drag",
+        "scroll": "scroll", "mouse_down": "mouse_down", "mouse_up": "mouse_up",
+        "type": "type", "press_key": "press_key", "hotkey": "hotkey",
+        "key_down": "key_down", "key_up": "key_up",
+        "clipboard_get": "clipboard_get", "clipboard_set": "clipboard_set",
+        "run_command": "run_command", "launch": "launch",
+        "get_current_window": "get_current_window",
+        "get_app_windows": "get_app_windows", "list_windows": "list_windows",
+        "resize_window": "resize_window", "minimize_window": "minimize_window",
+        "maximize_window": "maximize_window", "restore_window": "restore_window",
+        "close_window": "close_window", "activate_window": "activate_window",
+        "list_processes": "list_processes", "kill_process": "kill_process",
+        "registry_read": "registry_read", "registry_write": "registry_write",
+        "list_services": "list_services", "service_status": "service_status",
+        "service_start": "service_start", "service_stop": "service_stop",
+        "service_restart": "service_restart", "system_info": "system_info",
+        "get_file_permissions": "get_file_permissions",
+        "accessibility_tree": "get_accessibility_tree",
+        "find_element": "find_element",
+        "get_ui_tree": "get_ui_tree", "find_ui_elements": "find_ui_elements",
+        "focus_ui_element": "focus_ui_element",
+        "invoke_ui_element": "invoke_ui_element",
+        "set_ui_value": "set_ui_value", "toggle_ui_element": "toggle_ui_element",
+        "select_ui_element": "select_ui_element",
+        "expand_ui_element": "expand_ui_element",
+        "scroll_ui_element_into_view": "scroll_ui_element_into_view",
+        "wait_for_ui_element": "wait_for_ui_element",
+        "file_read": "file_read", "file_write": "file_write",
+        "file_read_bytes": "file_read_bytes", "file_write_bytes": "file_write_bytes",
+        "file_exists": "file_exists", "dir_exists": "directory_exists",
+        "list_dir": "list_dir", "create_dir": "create_dir",
+        "delete_file": "delete_file", "delete_dir": "delete_dir",
+        "get_file_size": "get_file_size",
+        "move_file": "move_file", "copy_file": "copy_file",
+        "release_input_state": "mouse_up",
+        "doctor": "system_info",
+    }
+
+    async def handle_message(
+        self, session: RemoteComputerSession, msg: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        method = msg.get("method", "")
+        params = msg.get("params", {})
+        request_id = msg.get("id")
+        a = session.automation
+        acc = session.accessibility
+        f = session.file
+
+        # Capability check (P1)
+        cap = self.TOOL_CAPABILITIES.get(method)
+        if cap and not _tool_has_capability(cap):
+            return {"id": request_id, "error": f"Capability denied: {method}"}
+
+        try:
+            # Build operation — may be async or sync
+            handlers = {
+                "screenshot": a.screenshot,
+                "screenshot_region": lambda: a.screenshot_region(
+                    params.get("x", 0), params.get("y", 0),
+                    params.get("width", 1024), params.get("height", 768)
+                ),
+                "screenshot_window": lambda: a.screenshot_window(params.get("window_id")),
+                "get_screen_size": a.get_screen_size,
+                "get_cursor_position": a.get_cursor_position,
+                "click": lambda: a.left_click(params.get("x"), params.get("y")),
+                "right_click": lambda: a.right_click(params.get("x"), params.get("y")),
+                "middle_click": lambda: a.middle_click(params.get("x"), params.get("y")),
+                "double_click": lambda: a.double_click(params.get("x"), params.get("y")),
+                "move": lambda: a.move_cursor(params["x"], params["y"]),
+                "drag": lambda: a.drag_to(
+                    params["x"], params["y"],
+                    params.get("button", "left"),
+                    params.get("duration", 0.5),
+                ),
+                "scroll": lambda: a.scroll(
+                    params.get("scroll_x", 0), params.get("scroll_y", 0)
+                ),
+                "mouse_down": lambda: a.mouse_down(
+                    params.get("x"), params.get("y"), params.get("button", "left")
+                ),
+                "mouse_up": lambda: a.mouse_up(
+                    params.get("x"), params.get("y"), params.get("button", "left")
+                ),
+                "type": lambda: a.type_text(params["text"]),
+                "press_key": lambda: a.press_key(params["key"]),
+                "hotkey": lambda: a.hotkey(params["keys"]),
+                "key_down": lambda: a.key_down(params["key"]),
+                "key_up": lambda: a.key_up(params["key"]),
+                "clipboard_get": a.copy_to_clipboard,
+                "clipboard_set": lambda: a.set_clipboard(params["text"]),
+                "run_command": lambda: a.run_command(params["command"]),
+                "launch": lambda: a.launch(params["app"], params.get("args")),
+                "get_current_window": a.get_current_window_id,
+                "get_app_windows": lambda: a.get_application_windows(params["app"]),
+                "list_windows": a.list_all_windows,
+                "resize_window": lambda: a.resize_window(
+                    params["window_id"], params["width"], params["height"]
+                ),
+                "minimize_window": lambda: a.minimize_window(params["window_id"]),
+                "maximize_window": lambda: a.maximize_window(params["window_id"]),
+                "restore_window": lambda: a.restore_window(params["window_id"]),
+                "close_window": lambda: a.close_window(params["window_id"]),
+                "activate_window": lambda: a.activate_window(params["window_id"]),
+                "list_processes": a.list_processes,
+                "kill_process": lambda: a.kill_process(params["pid"]),
+                "registry_read": lambda: a.registry_read(
+                    params["key_path"], params.get("value_name", "")
+                ),
+                "registry_write": lambda: a.registry_write(
+                    params["key_path"], params["value_name"],
+                    params["value"], params.get("reg_type", "REG_SZ"),
+                ),
+                "list_services": a.list_services,
+                "service_status": lambda: a.service_status(params["name"]),
+                "service_start": lambda: a.service_start(params["name"]),
+                "service_stop": lambda: a.service_stop(params["name"]),
+                "service_restart": lambda: a.service_restart(params["name"]),
+                "system_info": a.system_info,
+                "get_file_permissions": lambda: a.get_file_permissions(str(path_policy.resolve(params["path"]))),
+                "accessibility_tree": acc.get_accessibility_tree,
+                "find_element": lambda: acc.find_element(
+                    params.get("role"), params.get("title")
+                ),
+                "get_ui_tree": lambda: acc.get_ui_tree(params.get("max_depth", 5)),
+                "find_ui_elements": lambda: acc.find_ui_elements(
+                    params.get("control_type"), params.get("name"),
+                    params.get("automation_id"), params.get("class_name"),
+                ),
+                "focus_ui_element": lambda: acc.focus_ui_element(params.get("element_id")),
+                "invoke_ui_element": lambda: acc.invoke_ui_element(params.get("element_id")),
+                "set_ui_value": lambda: acc.set_ui_value(
+                    params.get("element_id"), params.get("value")
+                ),
+                "toggle_ui_element": lambda: acc.toggle_ui_element(params.get("element_id")),
+                "select_ui_element": lambda: acc.select_ui_element(params.get("element_id")),
+                "expand_ui_element": lambda: acc.expand_ui_element(params.get("element_id")),
+                "scroll_ui_element_into_view": lambda: acc.scroll_ui_element_into_view(
+                    params.get("element_id")
+                ),
+                "wait_for_ui_element": lambda: acc.wait_for_ui_element(
+                    params.get("control_type"), params.get("name"),
+                    params.get("timeout_ms", 5000),
+                ),
+                "file_read": lambda: f.read_text(str(path_policy.resolve(params["path"]))),
+                "file_write": lambda: f.write_text(str(path_policy.resolve(params["path"])), params["content"]),
+                "file_read_bytes": lambda: f.read_bytes(
+                    str(path_policy.resolve(params["path"])), params.get("offset", 0), params.get("length")
+                ),
+                "file_write_bytes": lambda: f.write_bytes(
+                    str(path_policy.resolve(params["path"])), base64.b64decode(params["content_base64"])
+                ),
+                "file_exists": lambda: f.file_exists(str(path_policy.resolve(params["path"]))),
+                "dir_exists": lambda: f.directory_exists(str(path_policy.resolve(params["path"]))),
+                "list_dir": lambda: f.list_dir(str(path_policy.resolve(params["path"]))),
+                "create_dir": lambda: f.create_dir(str(path_policy.resolve(params["path"]))),
+                "delete_file": lambda: f.delete_file(str(path_policy.resolve(params["path"]))),
+                "delete_dir": lambda: f.delete_dir(str(path_policy.resolve(params["path"]))),
+                "get_file_size": lambda: f.get_file_size(str(path_policy.resolve(params["path"]))),
+                "move_file": lambda: f.move_file(str(path_policy.resolve(params["src"])), str(path_policy.resolve(params["dst"]))),
+                "copy_file": lambda: f.copy_file(str(path_policy.resolve(params["src"])), str(path_policy.resolve(params["dst"]))),
+                "release_input_state": a.release_input_state,
+                "doctor": a.system_info,
+            }
+
+            handler = handlers.get(method)
+            if handler is None:
+                return {"id": request_id, "error": f"Unknown method: {method}"}
+
+            # P0#8: Execute operation THEN timeout-wrap it.
+            # If the handler is a coroutine function, call it; if lambda, call lambda.
+            # All our lambdas return coroutines, so await result directly.
+            operation = handler()  # This returns a coroutine for lambdas
+            # For direct method refs (like a.screenshot), they return coroutines too
+
+            # P1: use per-session input lock for destructive ops
+            input_ops = {
+                "click", "right_click", "middle_click", "double_click",
+                "move", "drag", "scroll", "mouse_down", "mouse_up",
+                "type", "press_key", "hotkey", "key_down", "key_up",
+            }
+            if method in input_ops:
+                async with session.input_lock:
+                    result = await asyncio.wait_for(operation, timeout=OPERATION_TIMEOUT)
+            else:
+                result = await asyncio.wait_for(operation, timeout=OPERATION_TIMEOUT)
+
+            return {"id": request_id, "result": result}
+
+        except asyncio.TimeoutError:
+            return {"id": request_id, "error": "Operation timed out (60s)"}
+        except Exception as e:
+            logger.exception(f"Handler error: {method}")
+            return {"id": request_id, "error": str(e)}
+
+    async def serve(self, websocket):
+        session_id = uuid.uuid4().hex[:12]
+        session = RemoteComputerSession()
+        self.sessions[session_id] = session
+        logger.info(f"Session {session_id} connected ({len(self.sessions)} active)")
+
+        try:
+            if not await self._authenticate(websocket):
+                return
+
+            async def heartbeat():
+                while True:
+                    await asyncio.sleep(HEARTBEAT_INTERVAL)
+                    try:
+                        await websocket.ping()
+                    except Exception:
+                        break
+
+            hb_task = asyncio.create_task(heartbeat())
+
+            try:
+                async for raw in websocket:
+                    if len(raw) > MAX_MESSAGE_SIZE:
+                        await websocket.send(json.dumps({
+                            "id": None, "error": "Message too large"
+                        }))
+                        continue
+                    msg = json.loads(raw)
+                    resp = await self.handle_message(session, msg)
+                    await websocket.send(json.dumps(resp))
+                    session.last_heartbeat = time.time()
+            finally:
+                hb_task.cancel()
+                try:
+                    await hb_task
+                except asyncio.CancelledError:
+                    pass
+
+        except ConnectionClosed:
+            logger.info(f"Session {session_id} disconnected")
+        except Exception as e:
+            logger.exception(f"Session {session_id} error")
+        finally:
+            self.sessions.pop(session_id, None)
+
+    async def start(self):
+        if websockets is None:
+            logger.error("websockets not installed — pip install websockets")
+            return
+        async with websockets.serve(
+            self.serve, self.host, self.port,
+            max_size=MAX_MESSAGE_SIZE,
+            max_queue=8,
+            ping_interval=HEARTBEAT_INTERVAL,
+            ping_timeout=HEARTBEAT_TIMEOUT,
+        ):
+            logger.info(
+                f"WebSocket server ws://{self.host}:{self.port} "
+                f"(sessions={len(self.sessions)})"
+            )
+            await asyncio.Future()
+
+
+def main() -> None:
+    """Synchronous entry point — no re-parse of sys.argv."""
+    import argparse
+    parser = argparse.ArgumentParser(description="Computer Use Windows Remote Server")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--token", default=None)
+    args = parser.parse_args()
+
+    server = RemoteComputerServer(args.host, args.port, args.token)
+    try:
+        asyncio.run(server.start())
+    except KeyboardInterrupt:
+        logger.info("Server stopped")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,6 +1,6 @@
 """Computer Use Windows — Windows desktop control via MCP.
 
-Version: 2.1.4 (Blocker Fixes)
+Version: 2.1.3 (Blocker Fixes)
   BL#1: PILImage import added (NameError fix)
   BL#2: FastMCP(instructions=...) not description=
   BL#3: @mcp.tool(annotations={"readOnlyHint": True, ...})
@@ -13,5 +13,5 @@ Version: 2.1.4 (Blocker Fixes)
   PS: remote PathPolicy enforcement for all file operations
 """
 
-__version__ = "2.1.4"
+__version__ = "2.1.3"
 __all__ = ["__version__"]

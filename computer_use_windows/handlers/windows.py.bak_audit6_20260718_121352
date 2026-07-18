@@ -421,50 +421,50 @@ class WindowsAutomationHandler(BaseAutomationHandler):
     # ── Keyboard (P0: physical resolver + hotkey fail-closed) ──────────
 
     async def key_down(self, key: str) -> Dict[str, Any]:
-        """Hold a physical key down. Use computer_type for text input."""
         vk = _resolve_physical_key(key)
         if vk >= 0:
             _HELD_KEYS.append(vk)
             return _send_input_checked(_make_key_input(vk, KEYEVENTF_KEYDOWN))
-        return {
-            "success": False,
-            "error": f"Unknown physical key: '{key}'. "
-                     f"Use computer_type for text, key_down only supports physical keys."
-        }
+        if len(key) == 1:
+            results = [_send_input_checked(_make_key_input(0, KEYEVENTF_UNICODE))
+                       for _ in _utf16_units(key)]
+            return {"success": all(r["success"] for r in results)}
+        return {"success": False, "error": f"Unknown key: {key}"}
 
     async def key_up(self, key: str) -> Dict[str, Any]:
-        """Release a physical key. Use computer_type for text input."""
         vk = _resolve_physical_key(key)
         if vk >= 0:
             if vk in _HELD_KEYS:
                 _HELD_KEYS.remove(vk)
             return _send_input_checked(_make_key_input(vk, KEYEVENTF_KEYUP))
-        return {
-            "success": False,
-            "error": f"Unknown physical key: '{key}'. "
-                     f"Use computer_type for text, key_up only supports physical keys."
-        }
+        if len(key) == 1:
+            results = [_send_input_checked(_make_key_input(0, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP))
+                       for _ in _utf16_units(key)]
+            return {"success": all(r["success"] for r in results)}
+        return {"success": False, "error": f"Unknown key: {key}"}
 
     async def type_text(self, text: str) -> Dict[str, Any]:
-        """Type text via Unicode input — layout-independent, handles all scripts.
-        
-        Physical-key resolver is NOT used for text — all characters go through
-        KEYEVENTF_UNICODE. This ensures correct input regardless of active
-        keyboard layout (e.g. 'hello' stays 'hello' even with Russian layout).
-        """
-        requested = 0
-        inserted = 0
+        total_requested = 0; total_inserted = 0
         for char in text:
-            for unit in _utf16_units(char):
-                requested += 1
-                inserted += _send_unicode_key(unit, is_up=False)
-            await asyncio.sleep(0.002)
-            for unit in _utf16_units(char):
-                requested += 1
-                inserted += _send_unicode_key(unit, is_up=True)
+            vk = _resolve_physical_key(char)
+            if vk >= 0:
+                inserted = _send_key_event(vk, KEYEVENTF_KEYDOWN)
+                total_requested += 1; total_inserted += inserted
+                await asyncio.sleep(0.005)
+                inserted = _send_key_event(vk, KEYEVENTF_KEYUP)
+                total_requested += 1; total_inserted += inserted
+            else:
+                units = _utf16_units(char)
+                for unit in units:
+                    inserted = _send_unicode_key(unit, is_up=False)
+                    total_requested += 1; total_inserted += inserted
+                await asyncio.sleep(0.002)
+                for unit in units:
+                    inserted = _send_unicode_key(unit, is_up=True)
+                    total_requested += 1; total_inserted += inserted
             await asyncio.sleep(0.005)
-        ok = inserted == requested
-        return {"success": ok, "requested": requested, "inserted": inserted}
+        ok = total_inserted == total_requested
+        return {"success": ok, "requested": total_requested, "inserted": total_inserted}
 
     async def press_key(self, key: str) -> Dict[str, Any]:
         vk = _resolve_physical_key(key)
@@ -481,7 +481,6 @@ class WindowsAutomationHandler(BaseAutomationHandler):
 
     # P0: hotkey fail-closed + SendInput checks + try/finally
     async def hotkey(self, keys: List[str]) -> Dict[str, Any]:
-        """Press key combination with guaranteed release on cancel/timeout."""
         resolved = []
         unknown = []
         for key in keys:
@@ -496,25 +495,21 @@ class WindowsAutomationHandler(BaseAutomationHandler):
         if not resolved:
             return {"success": False, "error": "No resolvable keys"}
 
-        pressed = []
         down_results = []
+        for vk in resolved:
+            down_results.append(_send_input_checked(_make_key_input(vk, KEYEVENTF_KEYDOWN)))
+            await asyncio.sleep(0.01)
+
+        up_results = []
         try:
-            for vk in resolved:
-                result = _send_input_checked(_make_key_input(vk, KEYEVENTF_KEYDOWN))
-                down_results.append(result)
-                if not result["success"]:
-                    return {"success": False, "error": "Key down failed", "down": down_results}
-                pressed.append(vk)
-                await asyncio.sleep(0.01)
-
             await asyncio.sleep(0.05)
-            return {"success": True, "down": down_results}
-
         finally:
-            up_results = []
-            for vk in reversed(pressed):
+            for vk in reversed(resolved):
                 up_results.append(_send_input_checked(_make_key_input(vk, KEYEVENTF_KEYUP)))
                 await asyncio.sleep(0.01)
+
+        all_ok = all(r["success"] for r in down_results + up_results)
+        return {"success": all_ok, "down": down_results, "up": up_results}
 
     # ── Emergency input state release ─────────────────────────────────
 
@@ -756,11 +751,7 @@ class WindowsAutomationHandler(BaseAutomationHandler):
                               reg_type: str = "REG_SZ") -> Dict[str, Any]:
         def _write():
             root, subkey = self._parse_reg_path(key_path)
-            normalized = reg_type.upper()
-            if normalized not in self._REG_TYPE_MAP:
-                valid = ", ".join(sorted(self._REG_TYPE_MAP))
-                raise ValueError(f"Unsupported registry type: '{reg_type}'. Valid: {valid}")
-            actual_type = self._REG_TYPE_MAP[normalized]
+            actual_type = self._REG_TYPE_MAP.get(reg_type.upper(), winreg.REG_SZ)
 
             # Convert value based on type
             if actual_type in (winreg.REG_DWORD, winreg.REG_QWORD):
