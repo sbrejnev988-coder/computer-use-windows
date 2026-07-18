@@ -18,8 +18,6 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 from fastmcp import FastMCP
 from fastmcp.utilities.types import Image
 from fastmcp.tools.tool import ToolResult
-from fastmcp.utilities.types import TextContent
-import json
 from PIL import Image as PILImage  # BL#1: was missing
 
 from ..handlers import (
@@ -54,8 +52,7 @@ CAPABILITY_SCOPES = {
     "desktop.input":        {"click", "double_click", "right_click", "middle_click",
                               "move", "drag", "scroll", "mouse_down", "mouse_up",
                               "type", "press_key", "hotkey", "key_down", "key_up",
-                              "clipboard_get", "clipboard_set",
-                              "release_input_state"},
+                              "clipboard_get", "clipboard_set"},
 
     "desktop.windows":      {"activate_window", "resize_window", "minimize_window",
                               "maximize_window", "restore_window", "close_window",
@@ -292,26 +289,16 @@ def _screenshot_to_result(
     frame = _make_frame(screenshot, img, capture_kind, window_id)
     buf = BytesIO()
     img.save(buf, format="PNG")
-    frame_data = {
-        "frame_id": frame.frame_id,
-        "capture_kind": frame.capture_kind,
-        "left": frame.left, "top": frame.top,
-        "source_width": frame.source_width, "source_height": frame.source_height,
-        "image_width": frame.image_width, "image_height": frame.image_height,
-    }
-
     image_content = Image(data=buf.getvalue(), format="png").to_image_content()
-
     return ToolResult(
-        content=[
-            image_content,
-            TextContent(
-                type="text",
-                text=json.dumps({"frame": frame_data}),
-            ),
-        ],
-        structured_content={"frame": frame_data},
-        meta=frame_data,
+        content=[image_content],
+        meta={
+            "frame_id": frame.frame_id,
+            "capture_kind": frame.capture_kind,
+            "left": frame.left, "top": frame.top,
+            "source_width": frame.source_width, "source_height": frame.source_height,
+            "image_width": frame.image_width, "image_height": frame.image_height,
+        },
     )
 
 
@@ -371,7 +358,7 @@ def create_server() -> FastMCP:
     mcp = FastMCP(
         "Computer Use Windows",
         instructions="Windows desktop control via MCP — mouse, keyboard, UIA, files, system",
-        version="2.1.3",
+        version="2.1.2",
     )
 
     # ─── Helper: tool registration with annotations ────────────────────

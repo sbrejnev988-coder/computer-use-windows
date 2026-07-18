@@ -333,13 +333,7 @@ class RemoteComputerServer:
         if websockets is None:
             logger.error("websockets not installed — pip install websockets")
             return
-        async with websockets.serve(
-            self.serve, self.host, self.port,
-            max_size=MAX_MESSAGE_SIZE,
-            max_queue=8,
-            ping_interval=HEARTBEAT_INTERVAL,
-            ping_timeout=HEARTBEAT_TIMEOUT,
-        ):
+        async with websockets.serve(self.serve, self.host, self.port):
             logger.info(
                 f"WebSocket server ws://{self.host}:{self.port} "
                 f"(sessions={len(self.sessions)})"

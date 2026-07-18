@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "computer-use-windows"
-version = "2.1.2"
+version = "2.1.3"
 description = "Windows desktop control MCP server — mouse, keyboard, UI Automation, files, system"
 readme = "README.md"
 license = { text = "MIT" }
