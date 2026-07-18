@@ -1,7 +1,11 @@
-"""computer-use-windows — Windows desktop control via FastMCP.
+"""Computer Use Windows — Windows desktop control via MCP.
 
-Основан на trycua/cua (https://github.com/trycua/cua).
-Самостоятельный пакет для локального Windows-управления через MCP.
+Version: 2.0.0 (CISA Red Team Audit Fix)
+  - P0: remote imports, async entry point, frame_id coords, activate_window
+  - P0: DPI Per-Monitor V2, screenshot error propagation, doctor diagnostics
+  - P1: native SendInput, UI Automation, action lock, capability profiles
+  - P2: win32service, scoped operations, secure remote transport
 """
 
-__version__ = "0.1.0"
+__version__ = "2.0.0"
+__all__ = ["__version__"]

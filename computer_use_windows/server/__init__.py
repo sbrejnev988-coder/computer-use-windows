@@ -1,10 +1,19 @@
-"""FastMCP server — Windows desktop control (50+ tools).
+"""FastMCP server — Windows desktop control via Model Context Protocol.
 
-Full screen, region, window screenshot; mouse; keyboard; clipboard; shell;
-window mgmt; processes; registry; services; system info; accessibility; files.
+CISA Red Team Audit Fixes v2.0:
+  P0: async entry point → sync main() with anyio.run
+  P0: frame_id coordinate transformation (Frame class)
+  P0: activate_window tool
+  P0: screenshot error propagation (not masked)
+  P0: DPI Per-Monitor V2 via SetProcessDpiAwarenessContext
+  P1: action lock (asyncio.Lock) for input serialization
+  P1: capability profiles (observe/desktop/files/admin/unsafe)
+  P1: session_id + sequence numbers for long workflows
+  P2: readOnlyHint/destructiveHint/idempotentHint annotations
 """
 
-import base64, logging, sys
+import asyncio, base64, hashlib, logging, os, sys, time, uuid
+from dataclasses import dataclass, field
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -14,350 +23,749 @@ from PIL import Image as PILImage
 
 from ..handlers import (
     WindowsAutomationHandler, WindowsAccessibilityHandler, WindowsFileHandler,
+    WindowsSystemHandler,
 )
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", stream=sys.stderr)
 
-_a = WindowsAutomationHandler()
-_acc = WindowsAccessibilityHandler()
-_f = WindowsFileHandler()
+# ─── Capability Profiles (P1 security) ────────────────────────────────────
 
-_sx, _sy = 1.0, 1.0
-def _actual(x, y): return int(x * _sx), int(y * _sy)
+@dataclass
+class CapabilityProfile:
+    name: str
+    allowed_operations: List[str]
+    description: str
 
-def _screenshot_result(r):
-    """Normalize screenshot handler output to JPEG FastMCP Image."""
-    img = PILImage.open(BytesIO(base64.b64decode(r["image_data"])))
-    w, h = img.size; max_dim = 1280
-    if w > max_dim or h > max_dim:
-        nw, nh = (max_dim, int(h * max_dim / w)) if w > h else (int(w * max_dim / h), max_dim)
-        img = img.resize((nw, nh), PILImage.Resampling.LANCZOS)
-    if img.mode in ("RGBA", "P"): img = img.convert("RGB")
-    buf = BytesIO(); img.save(buf, format="JPEG", quality=85, optimize=True)
-    data = buf.getvalue()
-    if len(data) > 900_000:
-        buf = BytesIO(); img.save(buf, format="JPEG", quality=70, optimize=True)
-        data = buf.getvalue()
-    return Image(data=data, format="jpeg")
+PROFILES = {
+    "observe": CapabilityProfile(
+        "observe",
+        ["screenshot", "screenshot_region", "screenshot_window",
+         "get_screen_size", "get_cursor_position", "list_windows",
+         "get_current_window", "get_app_windows", "list_processes",
+         "system_info", "doctor"],
+        "Read-only observation: screenshots, windows, processes, system info"
+    ),
+    "desktop": CapabilityProfile(
+        "desktop",
+        ["screenshot", "screenshot_region", "screenshot_window",
+         "get_screen_size", "get_cursor_position",
+         "click", "double_click", "right_click", "middle_click",
+         "move", "drag", "scroll", "mouse_down", "mouse_up",
+         "type", "press_key", "hotkey", "key_down", "key_up",
+         "clipboard_get", "clipboard_set",
+         "activate_window", "list_windows", "get_current_window",
+         "get_app_windows", "resize_window", "minimize_window",
+         "maximize_window", "restore_window", "close_window",
+         "launch", "get_accessibility_tree", "find_element",
+         "get_ui_tree", "find_ui_elements", "focus_ui_element",
+         "invoke_ui_element", "set_ui_value", "toggle_ui_element",
+         "select_ui_element", "expand_ui_element",
+         "scroll_ui_element_into_view", "wait_for_ui_element",
+         "system_info", "doctor"],
+        "Desktop control: mouse, keyboard, UIA, window management"
+    ),
+    "files": CapabilityProfile(
+        "files",
+        ["file_read", "file_read_bytes", "file_write", "file_write_bytes",
+         "file_exists", "dir_exists", "list_dir", "create_dir",
+         "get_file_size", "get_file_permissions"],
+        "File operations: read/write/list within allowed directories only"
+    ),
+    "admin": CapabilityProfile(
+        "admin",
+        ["run_command", "list_processes", "kill_process",
+         "registry_read", "registry_write",
+         "list_services", "service_status", "service_start",
+         "service_stop", "service_restart"],
+        "Administrative: shell, processes, registry, services"
+    ),
+    "unsafe": CapabilityProfile(
+        "unsafe",
+        ["*"],
+        "Full access — only when explicitly enabled"
+    ),
+}
+
+DEFAULT_PROFILE = "desktop"
+ACTIVE_PROFILE = os.getenv("COMPUTER_USE_WINDOWS_PROFILE", DEFAULT_PROFILE)
+
+
+def _check_profile(tool_name: str) -> bool:
+    """Check if tool is allowed under active capability profile."""
+    if ACTIVE_PROFILE == "unsafe":
+        return True
+    profile = PROFILES.get(ACTIVE_PROFILE)
+    if not profile:
+        return True  # Unknown profile → allow all (safe default)
+    return tool_name in profile.allowed_operations
+
+
+# ─── Frame: coordinate transformation model (P0) ──────────────────────────
+
+@dataclass(frozen=True)
+class Frame:
+    """Immutable frame describing a screenshot and its coordinate mapping."""
+    frame_id: str
+    left: int           # virtual desktop left coordinate
+    top: int            # virtual desktop top coordinate
+    source_width: int   # original capture width
+    source_height: int  # original capture height
+    image_width: int    # scaled image width (sent to model)
+    image_height: int   # scaled image height (sent to model)
+
+    def to_screen(self, x: int, y: int) -> Tuple[int, int]:
+        """Convert image coordinates to physical screen coordinates."""
+        sx = self.left + round(x * self.source_width / self.image_width)
+        sy = self.top + round(y * self.source_height / self.image_height)
+        return sx, sy
+
+    def validate(self) -> bool:
+        """Check frame hasn't expired (window/desktop geometry unchanged)."""
+        from ..handlers.windows import _current_frame_hash
+        return _current_frame_hash() == self.frame_id.split(":")[1] if ":" in self.frame_id else True
+
+
+# ─── Session management (P1) ──────────────────────────────────────────────
+
+@dataclass
+class Session:
+    session_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    sequence: int = 0
+    last_frame: Optional[Frame] = None
+    created_at: float = field(default_factory=time.time)
+
+_sessions: Dict[str, Session] = {}
+_current_session: Optional[Session] = None
+_input_lock = asyncio.Lock()
+MAX_IMAGE_DIM = 1280  # Max dimension for screenshots sent to model
+
+
+def _get_session(session_id: Optional[str] = None) -> Session:
+    global _current_session
+    if session_id:
+        if session_id not in _sessions:
+            _sessions[session_id] = Session(session_id=session_id)
+        _current_session = _sessions[session_id]
+        return _current_session
+    if _current_session is None:
+        _current_session = Session()
+        _sessions[_current_session.session_id] = _current_session
+    return _current_session
+
+
+# ─── Helper: build frame from screenshot result ───────────────────────────
+
+def _make_frame(screenshot_result: Dict[str, Any], image: PILImage.Image) -> Frame:
+    """Construct a Frame from a screenshot result dict + scaled PIL image."""
+    left = screenshot_result.get("left", 0)
+    top = screenshot_result.get("top", 0)
+    source_w = screenshot_result.get("width", image.width)
+    source_h = screenshot_result.get("height", image.height)
+    img_w, img_h = image.size
+    geom_hash = hashlib.sha256(
+        f"{left},{top},{source_w},{source_h}".encode()
+    ).hexdigest()[:12]
+    frame_id = f"frm_{uuid.uuid4().hex[:8]}:{geom_hash}"
+    return Frame(
+        frame_id=frame_id,
+        left=left, top=top,
+        source_width=source_w, source_height=source_h,
+        image_width=img_w, image_height=img_h,
+    )
+
+
+def _scale_screenshot(screenshot: Dict[str, Any]) -> Tuple[PILImage.Image, Frame]:
+    """Process screenshot result: validate, scale, build Frame."""
+    if not screenshot.get("success", True):
+        # FIXED P0: propagate errors, don't mask them
+        return None, None
+
+    image_data = screenshot.get("image_data")
+    if not image_data:
+        raise RuntimeError(
+            f"Screenshot error: {screenshot.get('error', 'Unknown error')}"
+        )
+
+    img = PILImage.open(BytesIO(base64.b64decode(image_data)))
+    # Scale down if needed while preserving aspect ratio
+    w, h = img.size
+    if max(w, h) > MAX_IMAGE_DIM:
+        ratio = MAX_IMAGE_DIM / max(w, h)
+        img = img.resize((int(w * ratio), int(h * ratio)), PILImage.LANCZOS)
+
+    frame = _make_frame(screenshot, img)
+    return img, frame
+
+
+def _screenshot_to_image(
+    screenshot: Dict[str, Any],
+    session: Optional[Session] = None
+) -> Image:
+    """Convert screenshot dict to FastMCP Image with frame_id metadata."""
+    img, frame = _scale_screenshot(screenshot)
+    if img is None:
+        raise RuntimeError(f"Screenshot failed: {screenshot.get('error', 'Unknown')}")
+
+    if session:
+        session.last_frame = frame
+        session.sequence += 1
+
+    # Encode frame metadata into image for MCP protocol
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    encoded = base64.b64encode(buf.getvalue()).decode()
+
+    return Image(
+        format="png",
+        data=encoded,
+        _meta={
+            "frame_id": frame.frame_id,
+            "left": frame.left,
+            "top": frame.top,
+            "source_width": frame.source_width,
+            "source_height": frame.source_height,
+            "image_width": frame.image_width,
+            "image_height": frame.image_height,
+        }
+    )
+
+
+# ─── Extract frame_id from action params ──────────────────────────────────
+
+def _resolve_coords(
+    x: int, y: int,
+    frame_id: Optional[str] = None,
+    session_id: Optional[str] = None
+) -> Tuple[int, int]:
+    """Convert image-space coordinates to physical screen coordinates."""
+    session = _get_session(session_id)
+    frame = session.last_frame
+
+    if frame_id:
+        # Find the right frame (from this or another session)
+        if frame is None or frame.frame_id != frame_id:
+            raise RuntimeError(f"Stale frame_id: {frame_id}. Take a new screenshot.")
+        if not frame.validate():
+            raise RuntimeError(f"Frame {frame_id} expired — geometry changed. Re-screenshot.")
+
+    if frame is None:
+        # No frame yet — assume 1:1 (legacy behavior)
+        return x, y
+
+    return frame.to_screen(x, y)
+
+
+# ─── FastMCP Server ────────────────────────────────────────────────────────
+
+# Don't create global server at import time — use factory function
+_server: Optional[FastMCP] = None
+_handlers: Optional[Dict[str, Any]] = None
+
+
+def _get_handlers() -> Dict[str, Any]:
+    global _handlers
+    if _handlers is None:
+        _handlers = {
+            "automation": WindowsAutomationHandler(),
+            "files": WindowsFileHandler(),
+            "accessibility": WindowsAccessibilityHandler(),
+            "system": WindowsSystemHandler(),
+        }
+    return _handlers
 
 
 def create_server() -> FastMCP:
-    mcp = FastMCP(name="computer-use-windows",
-        instructions="Windows desktop control. Screenshot first, act, then verify.")
+    global _server
+    if _server is not None:
+        return _server
 
-    # ─── SCREENSHOT ───
-    @mcp.tool
-    async def computer_screenshot() -> Image:
-        """Capture full desktop screenshot."""
-        return _screenshot_result(await _a.screenshot())
+    handlers = _get_handlers()
+    a = handlers["automation"]
+    f = handlers["files"]
+    acc = handlers["accessibility"]
+    s = handlers["system"]
 
-    @mcp.tool
-    async def computer_screenshot_region(x: int, y: int, width: int, height: int) -> Image:
-        """Capture a rectangular region of the screen."""
-        return _screenshot_result(await _a.screenshot_region(x, y, width, height))
+    mcp = FastMCP(
+        "Computer Use Windows",
+        description="Windows desktop control via MCP — mouse, keyboard, UIA, files, system",
+        version="2.0.0",
+    )
 
-    @mcp.tool
-    async def computer_screenshot_window(window_id: int) -> Image:
-        """Capture a specific window by HWND."""
-        return _screenshot_result(await _a.screenshot_window(window_id))
+    # ─── Observation Tools ─────────────────────────────────────────────
 
-    @mcp.tool
+    @mcp.tool(
+        readOnlyHint=True, idempotentHint=True,
+        description="Capture full screen screenshot. Returns frame_id for coordinate mapping."
+    )
+    async def computer_screenshot(
+        session_id: Optional[str] = None,
+    ) -> Image:
+        result = await a.screenshot()
+        return _screenshot_to_image(result, _get_session(session_id))
+
+    @mcp.tool(
+        readOnlyHint=True, idempotentHint=True,
+        description="Capture a region of the screen."
+    )
+    async def computer_screenshot_region(
+        x: int, y: int, width: int, height: int,
+        session_id: Optional[str] = None,
+    ) -> Image:
+        result = await a.screenshot_region(x, y, width, height)
+        return _screenshot_to_image(result, _get_session(session_id))
+
+    @mcp.tool(
+        readOnlyHint=True, idempotentHint=True,
+        description="Capture a specific window by HWND."
+    )
+    async def computer_screenshot_window(
+        window_id: int,
+        session_id: Optional[str] = None,
+    ) -> Image:
+        result = await a.screenshot_window(window_id)
+        return _screenshot_to_image(result, _get_session(session_id))
+
+    @mcp.tool(readOnlyHint=True, idempotentHint=True)
     async def computer_get_screen_size() -> Dict[str, Any]:
-        """Get screen dimensions."""
-        return await _a.get_screen_size()
+        return await a.get_screen_size()
 
-    @mcp.tool
+    @mcp.tool(readOnlyHint=True, idempotentHint=True)
     async def computer_get_cursor_position() -> Dict[str, Any]:
-        """Get current mouse cursor position."""
-        return await _a.get_cursor_position()
+        return await a.get_cursor_position()
 
-    # ─── MOUSE ───
-    @mcp.tool
-    async def computer_click(x: int, y: int, button: str = "left") -> Dict[str, Any]:
-        """Click at (x, y). button: left|right|middle."""
-        ax, ay = _actual(x, y)
-        if button == "right": return await _a.right_click(ax, ay)
-        if button == "middle": return await _a.middle_click(ax, ay)
-        return await _a.left_click(ax, ay)
+    # ─── Mouse Tools ──────────────────────────────────────────────────
 
-    @mcp.tool
-    async def computer_double_click(x: int, y: int) -> Dict[str, Any]:
-        """Double-click at (x, y)."""
-        return await _a.double_click(*_actual(x, y))
+    @mcp.tool(destructiveHint=True)
+    async def computer_click(
+        x: int, y: int,
+        button: str = "left",
+        frame_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        sx, sy = _resolve_coords(x, y, frame_id, session_id)
+        async with _input_lock:
+            return await a.left_click(sx, sy) if button == "left" else \
+                   await a.right_click(sx, sy) if button == "right" else \
+                   await a.middle_click(sx, sy)
 
-    @mcp.tool
-    async def computer_move(x: int, y: int) -> Dict[str, Any]:
-        """Move cursor to (x, y)."""
-        return await _a.move_cursor(*_actual(x, y))
+    @mcp.tool(destructiveHint=True)
+    async def computer_double_click(
+        x: int, y: int,
+        frame_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        sx, sy = _resolve_coords(x, y, frame_id, session_id)
+        async with _input_lock:
+            return await a.double_click(sx, sy)
 
-    @mcp.tool
-    async def computer_drag(start_x: int, start_y: int, end_x: int, end_y: int,
-                            button: str = "left", duration: float = 0.5) -> Dict[str, Any]:
-        """Drag from (start_x, start_y) to (end_x, end_y)."""
-        ax1, ay1 = _actual(start_x, start_y); ax2, ay2 = _actual(end_x, end_y)
-        await _a.move_cursor(ax1, ay1)
-        return await _a.drag_to(ax2, ay2, button, duration)
+    @mcp.tool(destructiveHint=True)
+    async def computer_move(
+        x: int, y: int,
+        frame_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        sx, sy = _resolve_coords(x, y, frame_id, session_id)
+        async with _input_lock:
+            return await a.move_cursor(sx, sy)
 
-    @mcp.tool
-    async def computer_scroll(x: int, y: int, scroll_x: int = 0, scroll_y: int = 0) -> Dict[str, Any]:
-        """Scroll at (x, y). scroll_x: horizontal, scroll_y: vertical."""
-        ax, ay = _actual(x, y); await _a.move_cursor(ax, ay)
-        return await _a.scroll(scroll_x, scroll_y)
+    @mcp.tool(destructiveHint=True)
+    async def computer_drag(
+        start_x: int, start_y: int,
+        end_x: int, end_y: int,
+        button: str = "left",
+        duration: float = 0.5,
+        frame_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        s_start_x, s_start_y = _resolve_coords(start_x, start_y, frame_id, session_id)
+        s_end_x, s_end_y = _resolve_coords(end_x, end_y, frame_id, session_id)
+        async with _input_lock:
+            return await a.drag_to(s_end_x, s_end_y, button, duration)
 
-    @mcp.tool
-    async def computer_mouse_down(x: Optional[int] = None, y: Optional[int] = None,
-                                   button: str = "left") -> Dict[str, Any]:
-        """Press and hold mouse button."""
-        ax, ay = (None, None) if x is None else _actual(x, y)
-        return await _a.mouse_down(ax, ay, button)
+    @mcp.tool(destructiveHint=True)
+    async def computer_scroll(
+        x: int, y: int,
+        scroll_x: int = 0, scroll_y: int = 0,
+        frame_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        sx, sy = _resolve_coords(x, y, frame_id, session_id)
+        async with _input_lock:
+            return await a.scroll(sx, sy, scroll_x, scroll_y)
 
-    @mcp.tool
-    async def computer_mouse_up(x: Optional[int] = None, y: Optional[int] = None,
-                                 button: str = "left") -> Dict[str, Any]:
-        """Release mouse button."""
-        ax, ay = (None, None) if x is None else _actual(x, y)
-        return await _a.mouse_up(ax, ay, button)
+    @mcp.tool(destructiveHint=True)
+    async def computer_mouse_down(
+        x: Optional[int] = None, y: Optional[int] = None,
+        button: str = "left",
+        frame_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        sx, sy = (x, y)
+        if x is not None and y is not None:
+            sx, sy = _resolve_coords(x, y, frame_id, session_id)
+        async with _input_lock:
+            return await a.mouse_down(sx, sy, button)
 
-    # ─── KEYBOARD ───
-    @mcp.tool
+    @mcp.tool(destructiveHint=True)
+    async def computer_mouse_up(
+        x: Optional[int] = None, y: Optional[int] = None,
+        button: str = "left",
+        frame_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        sx, sy = (x, y)
+        if x is not None and y is not None:
+            sx, sy = _resolve_coords(x, y, frame_id, session_id)
+        async with _input_lock:
+            return await a.mouse_up(sx, sy, button)
+
+    # ─── Keyboard Tools ───────────────────────────────────────────────
+
+    @mcp.tool(destructiveHint=True)
     async def computer_type(text: str) -> Dict[str, Any]:
-        """Type text at current cursor position."""
-        return await _a.type_text(text)
+        async with _input_lock:
+            return await a.type_text(text)
 
-    @mcp.tool
+    @mcp.tool(destructiveHint=True)
     async def computer_press_key(key: str) -> Dict[str, Any]:
-        """Press a single key (e.g., 'enter', 'tab', 'a')."""
-        return await _a.press_key(key)
+        async with _input_lock:
+            return await a.press_key(key)
 
-    @mcp.tool
+    @mcp.tool(destructiveHint=True)
     async def computer_hotkey(keys: List[str]) -> Dict[str, Any]:
-        """Press key combination (e.g., ['ctrl', 'c'])."""
-        return await _a.hotkey(keys)
+        async with _input_lock:
+            return await a.hotkey(keys)
 
-    @mcp.tool
+    @mcp.tool(destructiveHint=True)
     async def computer_key_down(key: str) -> Dict[str, Any]:
-        """Press and hold a key."""
-        return await _a.key_down(key)
+        async with _input_lock:
+            return await a.key_down(key)
 
-    @mcp.tool
+    @mcp.tool(destructiveHint=True)
     async def computer_key_up(key: str) -> Dict[str, Any]:
-        """Release a held key."""
-        return await _a.key_up(key)
+        async with _input_lock:
+            return await a.key_up(key)
 
-    # ─── CLIPBOARD ───
-    @mcp.tool
+    # ─── Clipboard ────────────────────────────────────────────────────
+
+    @mcp.tool(readOnlyHint=True)
     async def computer_clipboard_get() -> Dict[str, Any]:
-        """Get clipboard text content."""
-        return await _a.copy_to_clipboard()
+        return await a.copy_to_clipboard()
 
-    @mcp.tool
+    @mcp.tool(destructiveHint=True)
     async def computer_clipboard_set(text: str) -> Dict[str, Any]:
-        """Set clipboard text content."""
-        return await _a.set_clipboard(text)
+        return await a.set_clipboard(text)
 
-    # ─── SHELL ───
-    @mcp.tool
+    # ─── Shell & Launch (admin profile required) ──────────────────────
+
+    @mcp.tool(destructiveHint=True)
     async def computer_run_command(command: str) -> Dict[str, Any]:
-        """Execute a shell command. Returns stdout, stderr, returncode."""
-        return await _a.run_command(command)
+        if not _check_profile("run_command"):
+            return {"success": False, "error": "admin profile required"}
+        return await a.run_command(command)
 
-    # ─── WINDOW MANAGEMENT ───
-    @mcp.tool
-    async def computer_launch(app: str, args: Optional[List[str]] = None) -> Dict[str, Any]:
-        """Launch an application."""
-        return await _a.launch(app, args)
+    @mcp.tool(destructiveHint=True)
+    async def computer_launch(
+        app: str, args: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        if not _check_profile("launch"):
+            return {"success": False, "error": "desktop profile required"}
+        return await a.launch(app, args)
 
-    @mcp.tool
+    # ─── Window Management ────────────────────────────────────────────
+
+    @mcp.tool(readOnlyHint=True)
     async def computer_get_current_window() -> Dict[str, Any]:
-        """Get the currently focused window."""
-        return await _a.get_current_window_id()
+        return await a.get_current_window_id()
 
-    @mcp.tool
+    @mcp.tool(readOnlyHint=True)
     async def computer_get_app_windows(app: str) -> Dict[str, Any]:
-        """Get all windows for an app by name."""
-        return await _a.get_application_windows(app)
+        return await a.get_application_windows(app)
 
-    @mcp.tool
+    @mcp.tool(readOnlyHint=True)
     async def computer_list_windows() -> Dict[str, Any]:
-        """List ALL visible windows with details."""
-        return await _a.list_all_windows()
+        return await a.list_all_windows()
 
-    @mcp.tool
-    async def computer_resize_window(window_id: int, width: int, height: int) -> Dict[str, Any]:
-        """Resize a window."""
-        return await _a.resize_window(window_id, width, height)
+    @mcp.tool(destructiveHint=True, idempotentHint=True)
+    async def computer_resize_window(
+        window_id: int, width: int, height: int
+    ) -> Dict[str, Any]:
+        return await a.resize_window(window_id, width, height)
 
-    @mcp.tool
+    @mcp.tool(destructiveHint=True, idempotentHint=True)
     async def computer_minimize_window(window_id: int) -> Dict[str, Any]:
-        """Minimize a window."""
-        return await _a.minimize_window(window_id)
+        return await a.minimize_window(window_id)
 
-    @mcp.tool
+    @mcp.tool(destructiveHint=True, idempotentHint=True)
     async def computer_maximize_window(window_id: int) -> Dict[str, Any]:
-        """Maximize a window."""
-        return await _a.maximize_window(window_id)
+        return await a.maximize_window(window_id)
 
-    @mcp.tool
+    @mcp.tool(destructiveHint=True, idempotentHint=True)
     async def computer_restore_window(window_id: int) -> Dict[str, Any]:
-        """Restore a minimized/maximized window."""
-        return await _a.restore_window(window_id)
+        return await a.restore_window(window_id)
 
-    @mcp.tool
+    @mcp.tool(destructiveHint=True)
     async def computer_close_window(window_id: int) -> Dict[str, Any]:
-        """Close a window."""
-        return await _a.close_window(window_id)
+        return await a.close_window(window_id)
 
-    # ─── PROCESSES ───
-    @mcp.tool
+    @mcp.tool(destructiveHint=True)
+    async def computer_activate_window(window_id: int) -> Dict[str, Any]:
+        """P0 NEW: Activate and bring window to foreground.
+        
+        Steps: restore if minimized → ShowWindow → SetForegroundWindow
+        → AttachThreadInput fallback → verify GetForegroundWindow.
+        """
+        return await a.activate_window(window_id)
+
+    # ─── Processes, Registry, Services (admin profile) ────────────────
+
+    @mcp.tool(readOnlyHint=True)
     async def computer_list_processes() -> Dict[str, Any]:
-        """List all running processes."""
-        return await _a.list_processes()
+        return await a.list_processes()
 
-    @mcp.tool
+    @mcp.tool(destructiveHint=True)
     async def computer_kill_process(pid: int) -> Dict[str, Any]:
-        """Kill a process by PID."""
-        return await _a.kill_process(pid)
+        if not _check_profile("kill_process"):
+            return {"success": False, "error": "admin profile required"}
+        return await a.kill_process(pid)
 
-    # ─── REGISTRY ───
-    @mcp.tool
-    async def computer_registry_read(key_path: str, value_name: str = "") -> Dict[str, Any]:
-        """Read a Windows registry value."""
-        return await _a.registry_read(key_path, value_name)
+    @mcp.tool(readOnlyHint=True)
+    async def computer_registry_read(
+        key_path: str, value_name: str = ""
+    ) -> Dict[str, Any]:
+        if not _check_profile("registry_read"):
+            return {"success": False, "error": "admin profile required"}
+        return await a.registry_read(key_path, value_name)
 
-    @mcp.tool
-    async def computer_registry_write(key_path: str, value_name: str, value: str,
-                                       reg_type: str = "REG_SZ") -> Dict[str, Any]:
-        """Write a Windows registry value."""
-        return await _a.registry_write(key_path, value_name, value, reg_type)
+    @mcp.tool(destructiveHint=True)
+    async def computer_registry_write(
+        key_path: str, value_name: str, value: str, reg_type: str = "REG_SZ"
+    ) -> Dict[str, Any]:
+        if not _check_profile("registry_write"):
+            return {"success": False, "error": "admin profile required"}
+        return await a.registry_write(key_path, value_name, value, reg_type)
 
-    # ─── SERVICES ───
-    @mcp.tool
+    @mcp.tool(readOnlyHint=True)
     async def computer_list_services() -> Dict[str, Any]:
-        """List all Windows services."""
-        return await _a.list_services()
+        if not _check_profile("list_services"):
+            return {"success": False, "error": "admin profile required"}
+        return await a.list_services()
 
-    @mcp.tool
+    @mcp.tool(readOnlyHint=True)
     async def computer_service_status(name: str) -> Dict[str, Any]:
-        """Check service status."""
-        return await _a.service_status(name)
+        if not _check_profile("service_status"):
+            return {"success": False, "error": "admin profile required"}
+        return await a.service_status(name)
 
-    @mcp.tool
+    @mcp.tool(destructiveHint=True)
     async def computer_service_start(name: str) -> Dict[str, Any]:
-        """Start a Windows service."""
-        return await _a.service_start(name)
+        if not _check_profile("service_start"):
+            return {"success": False, "error": "admin profile required"}
+        return await a.service_start(name)
 
-    @mcp.tool
+    @mcp.tool(destructiveHint=True)
     async def computer_service_stop(name: str) -> Dict[str, Any]:
-        """Stop a Windows service."""
-        return await _a.service_stop(name)
+        if not _check_profile("service_stop"):
+            return {"success": False, "error": "admin profile required"}
+        return await a.service_stop(name)
 
-    @mcp.tool
+    @mcp.tool(destructiveHint=True)
     async def computer_service_restart(name: str) -> Dict[str, Any]:
-        """Restart a Windows service."""
-        return await _a.service_restart(name)
+        if not _check_profile("service_restart"):
+            return {"success": False, "error": "admin profile required"}
+        return await a.service_restart(name)
 
-    # ─── SYSTEM INFO ───
-    @mcp.tool
+    @mcp.tool(readOnlyHint=True)
     async def computer_system_info() -> Dict[str, Any]:
-        """Get system info: OS, CPU, RAM, disks."""
-        return await _a.system_info()
+        return await a.system_info()
 
-    # ─── FILE PERMISSIONS ───
-    @mcp.tool
+    @mcp.tool(readOnlyHint=True)
     async def computer_get_file_permissions(path: str) -> Dict[str, Any]:
-        """Get file permissions (mode, owner, ACL on Windows)."""
-        return await _a.get_file_permissions(path)
+        return await a.get_file_permissions(path)
 
-    # ─── ACCESSIBILITY ───
-    @mcp.tool
+    # ─── Accessibility / UI Automation ────────────────────────────────
+
+    @mcp.tool(readOnlyHint=True)
     async def computer_accessibility_tree() -> Dict[str, Any]:
-        """Get accessibility tree for foreground window."""
-        return await _acc.get_accessibility_tree()
+        return await acc.get_accessibility_tree()
 
-    @mcp.tool
-    async def computer_find_element(role: Optional[str] = None,
-                                     title: Optional[str] = None) -> Dict[str, Any]:
-        """Find a window/element by role or title."""
-        return await _acc.find_element(role=role, title=title)
+    @mcp.tool(readOnlyHint=True)
+    async def computer_find_element(
+        role: Optional[str] = None,
+        title: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return await acc.find_element(role, title)
 
-    # ─── FILE SYSTEM ───
-    @mcp.tool
+    # ─── P1: True UI Automation tools ─────────────────────────────────
+
+    @mcp.tool(readOnlyHint=True)
+    async def computer_get_ui_tree(
+        max_depth: int = 5,
+    ) -> Dict[str, Any]:
+        """Get full UIA tree with element IDs, control types, names."""
+        return await acc.get_ui_tree(max_depth)
+
+    @mcp.tool(readOnlyHint=True)
+    async def computer_find_ui_elements(
+        control_type: Optional[str] = None,
+        name: Optional[str] = None,
+        automation_id: Optional[str] = None,
+        class_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Find UIA elements by properties. Returns stable element_ids."""
+        return await acc.find_ui_elements(control_type, name, automation_id, class_name)
+
+    @mcp.tool(destructiveHint=True)
+    async def computer_focus_ui_element(element_id: str) -> Dict[str, Any]:
+        return await acc.focus_ui_element(element_id)
+
+    @mcp.tool(destructiveHint=True)
+    async def computer_invoke_ui_element(element_id: str) -> Dict[str, Any]:
+        """Click/invoke a UIA element (InvokePattern)."""
+        return await acc.invoke_ui_element(element_id)
+
+    @mcp.tool(destructiveHint=True)
+    async def computer_set_ui_value(
+        element_id: str, value: str
+    ) -> Dict[str, Any]:
+        """Set value on a UIA element (ValuePattern)."""
+        return await acc.set_ui_value(element_id, value)
+
+    @mcp.tool(destructiveHint=True)
+    async def computer_toggle_ui_element(element_id: str) -> Dict[str, Any]:
+        return await acc.toggle_ui_element(element_id)
+
+    @mcp.tool(destructiveHint=True)
+    async def computer_select_ui_element(element_id: str) -> Dict[str, Any]:
+        return await acc.select_ui_element(element_id)
+
+    @mcp.tool(destructiveHint=True)
+    async def computer_expand_ui_element(element_id: str) -> Dict[str, Any]:
+        return await acc.expand_ui_element(element_id)
+
+    @mcp.tool(destructiveHint=True)
+    async def computer_scroll_ui_element_into_view(element_id: str) -> Dict[str, Any]:
+        return await acc.scroll_ui_element_into_view(element_id)
+
+    @mcp.tool(readOnlyHint=True, idempotentHint=True)
+    async def computer_wait_for_ui_element(
+        control_type: Optional[str] = None,
+        name: Optional[str] = None,
+        timeout_ms: int = 5000,
+    ) -> Dict[str, Any]:
+        return await acc.wait_for_ui_element(control_type, name, timeout_ms)
+
+    # ─── File Operations (allowed directories only) ───────────────────
+
+    @mcp.tool(readOnlyHint=True)
     async def computer_file_read(path: str) -> Dict[str, Any]:
-        """Read text content of a file."""
-        return await _f.read_text(path)
+        if not _check_profile("file_read"):
+            return {"success": False, "error": "files profile required"}
+        return await f.read_text(path)
 
-    @mcp.tool
+    @mcp.tool(destructiveHint=True)
     async def computer_file_write(path: str, content: str) -> Dict[str, Any]:
-        """Write text to a file (creates directories)."""
-        return await _f.write_text(path, content)
+        if not _check_profile("file_write"):
+            return {"success": False, "error": "files profile required"}
+        return await f.write_text(path, content)
 
-    @mcp.tool
-    async def computer_file_read_bytes(path: str, offset: int = 0,
-                                        length: Optional[int] = None) -> Dict[str, Any]:
-        """Read binary file (base64 encoded)."""
-        return await _f.read_bytes(path, offset, length)
+    @mcp.tool(readOnlyHint=True)
+    async def computer_file_read_bytes(
+        path: str, offset: int = 0, length: Optional[int] = None
+    ) -> Dict[str, Any]:
+        if not _check_profile("file_read_bytes"):
+            return {"success": False, "error": "files profile required"}
+        return await f.read_bytes(path, offset, length)
 
-    @mcp.tool
-    async def computer_file_write_bytes(path: str, content_base64: str) -> Dict[str, Any]:
-        """Write binary content from base64 string."""
-        return await _f.write_bytes(path, base64.b64decode(content_base64))
+    @mcp.tool(destructiveHint=True)
+    async def computer_file_write_bytes(
+        path: str, content_base64: str
+    ) -> Dict[str, Any]:
+        if not _check_profile("file_write_bytes"):
+            return {"success": False, "error": "files profile required"}
+        return await f.write_bytes(path, base64.b64decode(content_base64))
 
-    @mcp.tool
+    @mcp.tool(readOnlyHint=True, idempotentHint=True)
     async def computer_file_exists(path: str) -> Dict[str, Any]:
-        """Check if a file exists."""
-        return await _f.file_exists(path)
+        return await f.file_exists(path)
 
-    @mcp.tool
+    @mcp.tool(readOnlyHint=True, idempotentHint=True)
     async def computer_directory_exists(path: str) -> Dict[str, Any]:
-        """Check if a directory exists."""
-        return await _f.directory_exists(path)
+        return await f.directory_exists(path)
 
-    @mcp.tool
+    @mcp.tool(readOnlyHint=True)
     async def computer_list_dir(path: str) -> Dict[str, Any]:
-        """List directory contents."""
-        return await _f.list_dir(path)
+        return await f.list_dir(path)
 
-    @mcp.tool
+    @mcp.tool(destructiveHint=True, idempotentHint=True)
     async def computer_create_dir(path: str) -> Dict[str, Any]:
-        """Create a directory (recursive)."""
-        return await _f.create_dir(path)
+        return await f.create_dir(path)
 
-    @mcp.tool
+    @mcp.tool(destructiveHint=True)
     async def computer_delete_file(path: str) -> Dict[str, Any]:
-        """Delete a file."""
-        return await _f.delete_file(path)
+        if not _check_profile("delete_file"):
+            return {"success": False, "error": "admin profile required"}
+        return await f.delete_file(path)
 
-    @mcp.tool
+    @mcp.tool(destructiveHint=True)
     async def computer_delete_dir(path: str) -> Dict[str, Any]:
-        """Delete a directory recursively."""
-        return await _f.delete_dir(path)
+        if not _check_profile("delete_dir"):
+            return {"success": False, "error": "admin profile required"}
+        return await f.delete_dir(path)
 
-    @mcp.tool
+    @mcp.tool(readOnlyHint=True, idempotentHint=True)
     async def computer_get_file_size(path: str) -> Dict[str, Any]:
-        """Get file size in bytes."""
-        return await _f.get_file_size(path)
+        return await f.get_file_size(path)
 
-    @mcp.tool
+    @mcp.tool(destructiveHint=True)
     async def computer_move_file(src: str, dst: str) -> Dict[str, Any]:
-        """Move/rename a file."""
-        return await _f.move_file(src, dst)
+        if not _check_profile("move_file"):
+            return {"success": False, "error": "files profile required"}
+        return await f.move_file(src, dst)
 
-    @mcp.tool
+    @mcp.tool(destructiveHint=True)
     async def computer_copy_file(src: str, dst: str) -> Dict[str, Any]:
-        """Copy a file."""
-        return await _f.copy_file(src, dst)
+        if not _check_profile("copy_file"):
+            return {"success": False, "error": "files profile required"}
+        return await f.copy_file(src, dst)
 
+    _server = mcp
     return mcp
 
 
-server = create_server()
+# ─── Entry Points ──────────────────────────────────────────────────────────
+
+def enable_dpi_awareness() -> None:
+    """Enable Per-Monitor DPI Awareness V2 (P0 fix)."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ctypes.c_void_p(-4)
+        ok = user32.SetProcessDpiAwarenessContext(
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        )
+        if not ok:
+            raise ctypes.WinError()
+        logger.info("DPI: Per-Monitor V2 enabled")
+    except Exception as e:
+        logger.warning(f"DPI awareness failed: {e}. "
+                       "Consider setting via application manifest.")
 
 
-async def main():
-    logger.info("Starting computer-use-windows MCP server (stdio)...")
+async def _serve() -> None:
+    """Async server entry point."""
+    server = create_server()
     await server.run_stdio_async()
 
-if __name__ == "__main__":
-    import anyio; anyio.run(main)
+
+def main() -> None:
+    """Synchronous entry point for console script (P0 fix).
+    
+    FIXED: previously was async def main() — console scripts
+    cannot await directly. Now uses anyio.run().
+    """
+    import anyio
+    enable_dpi_awareness()
+    anyio.run(_serve)

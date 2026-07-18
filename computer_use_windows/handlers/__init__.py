@@ -1,17 +1,29 @@
-"""computer-use-windows handlers.
+"""Handler exports — platform detection and factory."""
 
-Re-exports:
-- BaseAutomationHandler, BaseAccessibilityHandler, BaseFileHandler (from .base)
-- WindowsAutomationHandler, WindowsAccessibilityHandler, WindowsFileHandler (from .windows)
-- require_unlocked_desktop decorator
-- _HAS_WIN32 flag
-"""
+import sys
 
-from .base import BaseAutomationHandler, BaseAccessibilityHandler, BaseFileHandler
-from .windows import (
-    WindowsAutomationHandler,
-    WindowsAccessibilityHandler,
-    WindowsFileHandler,
-    require_unlocked_desktop,
-    _HAS_WIN32,
-)
+_HAS_WIN32 = sys.platform == "win32"
+
+if _HAS_WIN32:
+    from .windows import (
+        WindowsAutomationHandler,
+        WindowsAccessibilityHandler,
+        WindowsFileHandler,
+        WindowsSystemHandler,
+    )
+else:
+    # Stubs for non-Windows (testing, inspection)
+    from .base import (
+        BaseAutomationHandler as WindowsAutomationHandler,
+        BaseAccessibilityHandler as WindowsAccessibilityHandler,
+        BaseFileHandler as WindowsFileHandler,
+        BaseSystemHandler as WindowsSystemHandler,
+    )
+
+__all__ = [
+    "WindowsAutomationHandler",
+    "WindowsAccessibilityHandler",
+    "WindowsFileHandler",
+    "WindowsSystemHandler",
+    "_HAS_WIN32",
+]
