@@ -677,19 +677,14 @@ class WindowsAutomationHandler(BaseAutomationHandler):
             # Concurrent readers — prevents backpressure deadlock
             async def _read_limited(stream):
                 chunks = []
-                stored = 0
-                truncated = False
-                while True:
+                total = 0
+                while total < self.MAX_COMMAND_OUTPUT:
                     chunk = await stream.read(65536)
                     if not chunk:
                         break
-                    remaining = self.MAX_COMMAND_OUTPUT - stored
-                    if remaining > 0:
-                        chunks.append(chunk[:remaining])
-                        stored += min(len(chunk), remaining)
-                    if len(chunk) > remaining:
-                        truncated = True
-                return b"".join(chunks), truncated
+                    chunks.append(chunk)
+                    total += len(chunk)
+                return b"".join(chunks)
 
             async def _run_with_timeout():
                 stdout_task = asyncio.create_task(_read_limited(proc.stdout))
@@ -703,18 +698,16 @@ class WindowsAutomationHandler(BaseAutomationHandler):
                     )
                     for task in pending:
                         task.cancel()
-                    stdout_data, stdout_truncated = stdout_task.result() if stdout_task in done else (b"", False)
-                    stderr_data, stderr_truncated = stderr_task.result() if stderr_task in done else (b"", False)
+                    stdout = stdout_task.result() if stdout_task in done else b""
+                    stderr = stderr_task.result() if stderr_task in done else b""
                     if wait_task not in done:
                         proc.kill()
                         await proc.wait()
                     return {
                         "success": proc.returncode == 0 if wait_task in done else False,
                         "exit_code": proc.returncode if wait_task in done else -1,
-                        "stdout": stdout_data.decode("utf-8", errors="replace") if isinstance(stdout, bytes) else "",
-                        "stderr": stderr_data.decode("utf-8", errors="replace") if isinstance(stderr, bytes) else "",
-                        "stdout_truncated": stdout_truncated,
-                        "stderr_truncated": stderr_truncated,
+                        "stdout": stdout.decode("utf-8", errors="replace"),
+                        "stderr": stderr.decode("utf-8", errors="replace"),
                     }
                 except asyncio.TimeoutError:
                     proc.kill()
@@ -1065,14 +1058,9 @@ class WindowsAccessibilityHandler(BaseAccessibilityHandler):
         root = auto.GetRootControl()
         return self._build_tree(root, max_depth)
 
-    def _build_tree(self, control, max_depth: int, depth: int = 0, state: dict = None) -> Dict[str, Any]:
-        if state is None:
-            state = {"visited": 0}
+    def _build_tree(self, control, max_depth: int, depth: int = 0) -> Dict[str, Any]:
         if depth >= max_depth:
-            return {"_truncated": True, "_reason": "max_depth"}
-        if state["visited"] >= self.MAX_UIA_NODES:
-            return {"_truncated": True, "_reason": "max_nodes"}
-        state["visited"] += 1
+            return {"_truncated": True}
         try:
             node = {
                 "element_id": self._register_element(control),
@@ -1083,9 +1071,7 @@ class WindowsAccessibilityHandler(BaseAccessibilityHandler):
             children = []
             try:
                 for child in control.GetChildren():
-                    if state["visited"] >= self.MAX_UIA_NODES:
-                        break
-                    children.append(self._build_tree(child, max_depth, depth + 1, state))
+                    children.append(self._build_tree(child, max_depth, depth + 1))
             except Exception: pass
             if children: node["children"] = children
             return node

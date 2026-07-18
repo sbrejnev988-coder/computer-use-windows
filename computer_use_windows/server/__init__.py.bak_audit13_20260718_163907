@@ -363,19 +363,6 @@ def get_input_lock() -> asyncio.Lock:
     return _PROCESS_INPUT_LOCK
 
 
-async def _run_interactive_action(automation, operation):
-    """Unified wrapper for all interactive desktop operations.
-    
-    Checks desktop is not locked, then executes under process-wide input lock.
-    Use for: mouse, keyboard, UIA, window activation — any tool that changes
-    desktop state or depends on current input focus.
-    """
-    if automation.is_desktop_locked():
-        return {"success": False, "error": "Interactive desktop is locked"}
-    async with _PROCESS_INPUT_LOCK:
-        return await operation()
-
-
 def create_server() -> FastMCP:
     global _server
     if _server is not None:
@@ -456,7 +443,10 @@ def create_server() -> FastMCP:
                 return await a.right_click(sx, sy)
             else:
                 return await a.middle_click(sx, sy)
-        return await _run_interactive_action(a, _op)
+        if a.is_desktop_locked():
+            return {"success": False, "error": "Interactive desktop is locked"}
+        async with _PROCESS_INPUT_LOCK:
+            return await _op()
 
     @_tool(destructiveHint=True)
     @require_capability("double_click")
