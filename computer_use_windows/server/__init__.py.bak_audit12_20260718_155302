@@ -433,6 +433,8 @@ def create_server() -> FastMCP:
         With frame_id: coordinates refer to that screenshot.
         Without frame_id: coordinates are virtual-desktop pixels.
         """
+        locked = await _require_interactive_desktop(a)
+        if locked: return locked
         if button not in ("left", "right", "middle"):
             return {"success": False, "error": f"Unsupported button: '{button}'. Use left/right/middle."}
         sx, sy = _resolve_coords(x, y, frame_id)
@@ -443,10 +445,7 @@ def create_server() -> FastMCP:
                 return await a.right_click(sx, sy)
             else:
                 return await a.middle_click(sx, sy)
-        if a.is_desktop_locked():
-            return {"success": False, "error": "Interactive desktop is locked"}
-        async with _PROCESS_INPUT_LOCK:
-            return await _op()
+        return await a.run_desktop_action(_op)
 
     @_tool(destructiveHint=True)
     @require_capability("double_click")

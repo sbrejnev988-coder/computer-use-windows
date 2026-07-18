@@ -124,7 +124,7 @@ class RemoteComputerServer:
         "delete_file": "delete_file", "delete_dir": "delete_dir",
         "get_file_size": "get_file_size",
         "move_file": "move_file", "copy_file": "copy_file",
-        "release_input_state": "release_input_state",
+        "release_input_state": "mouse_up",
         "doctor": "system_info",
     }
 
@@ -134,17 +134,6 @@ class RemoteComputerServer:
         if "x" not in params or "y" not in params:
             raise ValueError("x and y are required for this operation")
         return int(params["x"]), int(params["y"])
-
-    @classmethod
-    def _optional_xy(cls, params: Dict[str, Any]) -> tuple:
-        """Extract optional x,y — fail if only one provided."""
-        has_x = "x" in params
-        has_y = "y" in params
-        if has_x != has_y:
-            raise ValueError("x and y must be provided together")
-        if not has_x:
-            return None, None
-        return cls._required_xy(params)
 
     async def handle_message(
         self, session: RemoteComputerSession, msg: Dict[str, Any]
@@ -186,11 +175,11 @@ class RemoteComputerServer:
                     params.get("scroll_x", 0), params.get("scroll_y", 0)
                 ),
                 "mouse_down": lambda: a.mouse_down(
-                    *self._optional_xy(params),
+                    *self._required_xy(params) if ("x" in params and "y" in params) else (None, None),
                     params.get("button", "left")
                 ),
                 "mouse_up": lambda: a.mouse_up(
-                    *self._optional_xy(params),
+                    *self._required_xy(params) if ("x" in params and "y" in params) else (None, None),
                     params.get("button", "left")
                 ),
                 "type": lambda: a.type_text(params["text"]),
