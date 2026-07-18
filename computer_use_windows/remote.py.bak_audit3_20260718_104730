@@ -18,7 +18,7 @@ except ImportError:
 from .handlers import (
     WindowsAutomationHandler, WindowsAccessibilityHandler, WindowsFileHandler,
 )
-from .server import _tool_has_capability, get_input_lock, path_policy  # share profile check
+from .server import _tool_has_capability  # share profile check
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +38,7 @@ class RemoteComputerSession:
         self.file = WindowsFileHandler()
         self.created_at = time.time()
         self.last_heartbeat = time.time()
-        self.input_lock = get_input_lock()  # PS: shared process-wide lock
+        self.input_lock = asyncio.Lock()  # P1: per-session lock
 
 
 class RemoteComputerServer:
@@ -205,7 +205,7 @@ class RemoteComputerServer:
                 "service_stop": lambda: a.service_stop(params["name"]),
                 "service_restart": lambda: a.service_restart(params["name"]),
                 "system_info": a.system_info,
-                "get_file_permissions": lambda: a.get_file_permissions(str(path_policy.resolve(params["path"]))),
+                "get_file_permissions": lambda: a.get_file_permissions(params["path"]),
                 "accessibility_tree": acc.get_accessibility_tree,
                 "find_element": lambda: acc.find_element(
                     params.get("role"), params.get("title")
@@ -230,23 +230,23 @@ class RemoteComputerServer:
                     params.get("control_type"), params.get("name"),
                     params.get("timeout_ms", 5000),
                 ),
-                "file_read": lambda: f.read_text(str(path_policy.resolve(params["path"]))),
-                "file_write": lambda: f.write_text(str(path_policy.resolve(params["path"])), params["content"]),
+                "file_read": lambda: f.read_text(params["path"]),
+                "file_write": lambda: f.write_text(params["path"], params["content"]),
                 "file_read_bytes": lambda: f.read_bytes(
-                    str(path_policy.resolve(params["path"])), params.get("offset", 0), params.get("length")
+                    params["path"], params.get("offset", 0), params.get("length")
                 ),
                 "file_write_bytes": lambda: f.write_bytes(
-                    str(path_policy.resolve(params["path"])), base64.b64decode(params["content_base64"])
+                    params["path"], base64.b64decode(params["content_base64"])
                 ),
-                "file_exists": lambda: f.file_exists(str(path_policy.resolve(params["path"]))),
-                "dir_exists": lambda: f.directory_exists(str(path_policy.resolve(params["path"]))),
-                "list_dir": lambda: f.list_dir(str(path_policy.resolve(params["path"]))),
-                "create_dir": lambda: f.create_dir(str(path_policy.resolve(params["path"]))),
-                "delete_file": lambda: f.delete_file(str(path_policy.resolve(params["path"]))),
-                "delete_dir": lambda: f.delete_dir(str(path_policy.resolve(params["path"]))),
-                "get_file_size": lambda: f.get_file_size(str(path_policy.resolve(params["path"]))),
-                "move_file": lambda: f.move_file(str(path_policy.resolve(params["src"])), str(path_policy.resolve(params["dst"]))),
-                "copy_file": lambda: f.copy_file(str(path_policy.resolve(params["src"])), str(path_policy.resolve(params["dst"]))),
+                "file_exists": lambda: f.file_exists(params["path"]),
+                "dir_exists": lambda: f.directory_exists(params["path"]),
+                "list_dir": lambda: f.list_dir(params["path"]),
+                "create_dir": lambda: f.create_dir(params["path"]),
+                "delete_file": lambda: f.delete_file(params["path"]),
+                "delete_dir": lambda: f.delete_dir(params["path"]),
+                "get_file_size": lambda: f.get_file_size(params["path"]),
+                "move_file": lambda: f.move_file(params["src"], params["dst"]),
+                "copy_file": lambda: f.copy_file(params["src"], params["dst"]),
                 "doctor": a.system_info,
             }
 

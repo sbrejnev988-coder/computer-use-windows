@@ -1,15 +1,17 @@
 """Computer Use Windows — Windows desktop control via MCP.
 
-Version: 2.1.0 (CISA Audit Round 2)
-  P0#1: screenshot → ToolResult (not Image with _meta)
-  P0#2: computer_scroll → move + scroll(scroll_x, scroll_y)
-  P0#3: computer_drag → move to start first
-  P0#4: Frame validation — desktop_hash + registry, not last_frame
-  P0#5: CLI remote — pass args directly, no re-parse
-  P0#6: capability policy → fail-closed + require_capability decorator
-  P0#7: PathPolicy — allowed roots, resolve, symlink check
-  P0#8: remote timeout — wraps actual operation, not lambda thread
+Version: 2.1.1 (Blocker Fixes)
+  BL#1: PILImage import added (NameError fix)
+  BL#2: FastMCP(instructions=...) not description=
+  BL#3: @mcp.tool(annotations={"readOnlyHint": True, ...})
+  PS: mouse_down/up: None,None → don't move cursor
+  PS: keyboard VkKeyScanW resolver for letter/numeral keys
+  PS: activate_window GetWindowThreadProcessId tuple fix
+  PS: surrogate pairs for emoji (>U+FFFF)
+  PS: frame_id bounds check (0 <= x < image_width)
+  PS: single process-wide _PROCESS_INPUT_LOCK (shared remote+local)
+  PS: remote PathPolicy enforcement for all file operations
 """
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 __all__ = ["__version__"]
