@@ -318,30 +318,22 @@ class WindowsAutomationHandler(BaseAutomationHandler):
     def _set_cursor_pos(self, x: int, y: int):
         win32api.SetCursorPos((x, y))
 
-    _MOUSE_DOWN = {"left": MOUSEEVENTF_LEFTDOWN, "right": MOUSEEVENTF_RIGHTDOWN,
-                   "middle": MOUSEEVENTF_MIDDLEDOWN}
-
     async def mouse_down(self, x=None, y=None, button="left") -> Dict[str, Any]:
-        if button not in self._MOUSE_DOWN:
-            return {"success": False, "error": f"Unsupported button: '{button}'. Use left/right/middle."}
         if x is not None and y is not None:
             self._set_cursor_pos(x, y)
-        flags = self._MOUSE_DOWN[button]
+        flags = {"left": MOUSEEVENTF_LEFTDOWN, "right": MOUSEEVENTF_RIGHTDOWN,
+                 "middle": MOUSEEVENTF_MIDDLEDOWN}.get(button, MOUSEEVENTF_LEFTDOWN)
         px, py = win32api.GetCursorPos()
         result = self._send_mouse_checked(flags, px, py)
         if result["success"]:
             _HELD_BUTTONS.append(button)
         return result
 
-    _MOUSE_UP = {"left": MOUSEEVENTF_LEFTUP, "right": MOUSEEVENTF_RIGHTUP,
-                 "middle": MOUSEEVENTF_MIDDLEUP}
-
     async def mouse_up(self, x=None, y=None, button="left") -> Dict[str, Any]:
-        if button not in self._MOUSE_UP:
-            return {"success": False, "error": f"Unsupported button: '{button}'. Use left/right/middle."}
         if x is not None and y is not None:
             self._set_cursor_pos(x, y)
-        flags = self._MOUSE_UP[button]
+        flags = {"left": MOUSEEVENTF_LEFTUP, "right": MOUSEEVENTF_RIGHTUP,
+                 "middle": MOUSEEVENTF_MIDDLEUP}.get(button, MOUSEEVENTF_LEFTUP)
         px, py = win32api.GetCursorPos()
         if button in _HELD_BUTTONS:
             _HELD_BUTTONS.remove(button)
@@ -475,28 +467,17 @@ class WindowsAutomationHandler(BaseAutomationHandler):
         return {"success": ok, "requested": requested, "inserted": inserted}
 
     async def press_key(self, key: str) -> Dict[str, Any]:
-        """Press and release a physical key. Guaranteed release on cancel."""
         vk = _resolve_physical_key(key)
         if vk >= 0:
-            down = _send_input_checked(_make_key_input(vk, KEYEVENTF_KEYDOWN))
-            if not down["success"]:
-                return {"success": False, "down": down, "error": "Key down failed"}
-            up = None
-            try:
-                await asyncio.sleep(0.02)
-            finally:
-                up = _send_input_checked(_make_key_input(vk, KEYEVENTF_KEYUP))
-            return {"success": down["success"] and up["success"], "down": down, "up": up}
+            r1 = _send_input_checked(_make_key_input(vk, KEYEVENTF_KEYDOWN))
+            await asyncio.sleep(0.02)
+            r2 = _send_input_checked(_make_key_input(vk, KEYEVENTF_KEYUP))
+            return {"success": r1["success"] and r2["success"]}
         if len(key) == 1:
             units = _utf16_units(key)
-            # Send all down+up pairs in one batch for atomicity
-            inputs = []
-            for u in units:
-                inputs.append(_make_key_input(0, KEYEVENTF_UNICODE))          # down
-                inputs.append(_make_key_input(0, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP))  # up
-            result = _send_input_checked(*inputs)
-            return result
-        return {"success": False, "error": f"Unknown physical key: '{key}'. Use computer_type for text."}
+            inserted = sum(_send_unicode_key(u, False) + _send_unicode_key(u, True) for u in units)
+            return {"success": inserted == 2 * len(units), "inserted": inserted}
+        return {"success": False, "error": f"Unknown key: {key}"}
 
     # P0: hotkey fail-closed + SendInput checks + try/finally
     async def hotkey(self, keys: List[str]) -> Dict[str, Any]:
@@ -517,31 +498,23 @@ class WindowsAutomationHandler(BaseAutomationHandler):
 
         pressed = []
         down_results = []
-        up_results = []
-        operation_ok = False
         try:
             for vk in resolved:
                 result = _send_input_checked(_make_key_input(vk, KEYEVENTF_KEYDOWN))
                 down_results.append(result)
                 if not result["success"]:
-                    break
+                    return {"success": False, "error": "Key down failed", "down": down_results}
                 pressed.append(vk)
                 await asyncio.sleep(0.01)
-            else:
-                await asyncio.sleep(0.05)
-                operation_ok = True
-        finally:
-            for vk in reversed(pressed):
-                result = _send_input_checked(_make_key_input(vk, KEYEVENTF_KEYUP))
-                up_results.append(result)
-                await asyncio.sleep(0.01)
 
-        release_ok = all(r["success"] for r in up_results) if up_results else True
-        return {
-            "success": operation_ok and release_ok,
-            "down": down_results,
-            "up": up_results,
-        }
+            await asyncio.sleep(0.05)
+            return {"success": True, "down": down_results}
+
+        finally:
+            up_results = []
+            for vk in reversed(pressed):
+                up_results.append(_send_input_checked(_make_key_input(vk, KEYEVENTF_KEYUP)))
+                await asyncio.sleep(0.01)
 
     # ── Emergency input state release ─────────────────────────────────
 

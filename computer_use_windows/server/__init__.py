@@ -426,6 +426,13 @@ def create_server() -> FastMCP:
         x: int, y: int, button: str = "left",
         frame_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """Click a point on the Windows desktop.
+
+        With frame_id: coordinates refer to that screenshot.
+        Without frame_id: coordinates are virtual-desktop pixels.
+        """
+        if button not in ("left", "right", "middle"):
+            return {"success": False, "error": f"Unsupported button: '{button}'. Use left/right/middle."}
         sx, sy = _resolve_coords(x, y, frame_id)
         async with _PROCESS_INPUT_LOCK:
             if button == "left":

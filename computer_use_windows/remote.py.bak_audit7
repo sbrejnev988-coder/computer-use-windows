@@ -245,8 +245,8 @@ class RemoteComputerServer:
                 "dir_exists": lambda: f.directory_exists(str(path_policy.resolve(params["path"]))),
                 "list_dir": lambda: f.list_dir(str(path_policy.resolve(params["path"]))),
                 "create_dir": lambda: f.create_dir(str(path_policy.resolve(params["path"]))),
-                "delete_file": lambda: f.delete_file(str(path_policy.resolve(params["path"], destructive=True))),
-                "delete_dir": lambda: f.delete_dir(str(path_policy.resolve(params["path"], destructive=True))),
+                "delete_file": lambda: f.delete_file(str(path_policy.resolve(params["path"]))),
+                "delete_dir": lambda: f.delete_dir(str(path_policy.resolve(params["path"]))),
                 "get_file_size": lambda: f.get_file_size(str(path_policy.resolve(params["path"]))),
                 "move_file": lambda: f.move_file(str(path_policy.resolve(params["src"])), str(path_policy.resolve(params["dst"]))),
                 "copy_file": lambda: f.copy_file(str(path_policy.resolve(params["src"])), str(path_policy.resolve(params["dst"]))),
@@ -269,10 +269,6 @@ class RemoteComputerServer:
                 "click", "right_click", "middle_click", "double_click",
                 "move", "drag", "scroll", "mouse_down", "mouse_up",
                 "type", "press_key", "hotkey", "key_down", "key_up",
-                "release_input_state",
-                "focus_ui_element", "invoke_ui_element", "set_ui_value",
-                "toggle_ui_element", "select_ui_element",
-                "expand_ui_element", "scroll_ui_element_into_view",
             }
             if method in input_ops:
                 async with session.input_lock:
