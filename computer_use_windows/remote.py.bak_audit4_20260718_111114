@@ -18,8 +18,7 @@ except ImportError:
 from .handlers import (
     WindowsAutomationHandler, WindowsAccessibilityHandler, WindowsFileHandler,
 )
-from .server import _tool_has_capability, get_input_lock, path_policy
-from .handlers.windows import initialize_windows_runtime  # share profile check
+from .server import _tool_has_capability, get_input_lock, path_policy  # share profile check
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +54,6 @@ class RemoteComputerServer:
                 f"A token is required for non-loopback bind. "
                 f"Set {DEFAULT_TOKEN_ENV} or pass --token."
             )
-        initialize_windows_runtime()  # #5: DPI bootstrap
         self.sessions: Dict[str, RemoteComputerSession] = {}
         logger.info(
             f"Remote server ws://{host}:{port} "
@@ -124,7 +122,6 @@ class RemoteComputerServer:
         "delete_file": "delete_file", "delete_dir": "delete_dir",
         "get_file_size": "get_file_size",
         "move_file": "move_file", "copy_file": "copy_file",
-        "release_input_state": "mouse_up",
         "doctor": "system_info",
     }
 
@@ -250,7 +247,6 @@ class RemoteComputerServer:
                 "get_file_size": lambda: f.get_file_size(str(path_policy.resolve(params["path"]))),
                 "move_file": lambda: f.move_file(str(path_policy.resolve(params["src"])), str(path_policy.resolve(params["dst"]))),
                 "copy_file": lambda: f.copy_file(str(path_policy.resolve(params["src"])), str(path_policy.resolve(params["dst"]))),
-                "release_input_state": a.release_input_state,
                 "doctor": a.system_info,
             }
 

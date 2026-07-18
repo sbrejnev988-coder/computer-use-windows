@@ -132,13 +132,6 @@ class BaseAutomationHandler(ABC):
         """
         ...
 
-    # ── Emergency release ────────────────────────────────────────────
-
-    @abstractmethod
-    async def release_input_state(self) -> Dict[str, Any]:
-        """Emergency: release all modifier keys + mouse buttons."""
-        ...
-
     # ── Processes ─────────────────────────────────────────────────────
 
     @abstractmethod

@@ -1,15 +1,14 @@
-"""Windows Win32 API + UI Automation handler.
+"""Windows Win32 API + UI Automation handler — real desktop control.
 
-v2.1.2 — Audit Round 4:
-  #1 UIA: separate matching from traversal — children always visited
-  #2 type_text: Unicode-only via KEYEVENTF_UNICODE (no VkKeyScanW for text)
-  #3 SendInput: check returned insertion count — report failures
-  #4 drag/hotkey/type: try/finally ensures mouse/key release on cancel
-  #5 DPI: initialize_windows_runtime() called from both MCP + remote
-  #6 Blocking ops → asyncio.to_thread for ImageGrab, UIA tree, registry, services
+v2.1.1:
+  PS: keyboard VkKeyScanW resolver for letter/numeral keys
+  PS: activate_window fix: GetWindowThreadProcessId returns tuple
+  PS: mouse_down/up: None,None → don't move cursor
+  PS: surrogate pairs for emoji (UTF-16 units)
+  PS: key_down/key_up: VkKeyScan for char keys, keydown-only/keyup-only
 """
 
-import asyncio, base64, ctypes, functools, logging, math, os, subprocess, sys, time
+import asyncio, base64, ctypes, functools, logging, os, subprocess, sys, time
 from io import BytesIO
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
@@ -20,30 +19,7 @@ from .base import (
 
 logger = logging.getLogger(__name__)
 
-# ─── Runtime bootstrap ─────────────────────────────────────────────────────
-
-_dpi_initialized = False
-
-def initialize_windows_runtime() -> None:
-    """One-time Win32/COM/DPI bootstrap. Call from ALL entry points."""
-    global _dpi_initialized
-    if _dpi_initialized:
-        return
-    _dpi_initialized = True
-    if sys.platform != "win32":
-        return
-    try:
-        import ctypes
-        user32 = ctypes.windll.user32
-        ok = user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
-        if not ok:
-            raise ctypes.WinError()
-        logger.info("DPI: Per-Monitor V2 enabled")
-    except Exception as e:
-        logger.warning(f"DPI awareness failed: {e}")
-
-
-# ─── Win32 imports ─────────────────────────────────────────────────────────
+# ─── Win32 Imports ─────────────────────────────────────────────────────────
 
 if sys.platform == "win32":
     import win32api, win32con, win32gui, win32process, win32clipboard
@@ -65,7 +41,7 @@ if sys.platform == "win32":
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
 
-    INPUT_MOUSE = 0; INPUT_KEYBOARD = 1
+    INPUT_MOUSE = 0; INPUT_KEYBOARD = 1; INPUT_HARDWARE = 2
     KEYEVENTF_KEYDOWN = 0x0000; KEYEVENTF_KEYUP = 0x0002
     KEYEVENTF_UNICODE = 0x0004; KEYEVENTF_SCANCODE = 0x0008
     MOUSEEVENTF_MOVE = 0x0001; MOUSEEVENTF_LEFTDOWN = 0x0002
@@ -81,7 +57,8 @@ if sys.platform == "win32":
         _fields_ = [
             ("dx", wintypes.LONG), ("dy", wintypes.LONG),
             ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
-            ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+            ("time", wintypes.DWORD),
+            ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
         ]
 
     class KEYBDINPUT(ctypes.Structure):
@@ -91,8 +68,14 @@ if sys.platform == "win32":
             ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
         ]
 
+    class HARDWAREINPUT(ctypes.Structure):
+        _fields_ = [
+            ("uMsg", wintypes.DWORD),
+            ("wParamL", wintypes.WORD), ("wParamH", wintypes.WORD),
+        ]
+
     class INPUT_UNION(ctypes.Union):
-        _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT)]
+        _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT), ("hi", HARDWAREINPUT)]
 
     class INPUT(ctypes.Structure):
         _fields_ = [("type", wintypes.DWORD), ("union", INPUT_UNION)]
@@ -101,15 +84,6 @@ if sys.platform == "win32":
         n = len(inputs)
         arr = (INPUT * n)(*inputs)
         return user32.SendInput(n, arr, ctypes.sizeof(INPUT))
-
-    # #3: wrapper that checks insertion count
-    def _send_input_checked(*inputs: INPUT) -> Dict[str, Any]:
-        n = len(inputs)
-        inserted = _send_input(*inputs)
-        ok = (inserted == n)
-        if not ok:
-            logger.warning(f"SendInput: requested={n} inserted={inserted}")
-        return {"success": ok, "requested": n, "inserted": inserted}
 
     def _virtual_desktop_coords(x: int, y: int) -> Tuple[int, int]:
         vw = user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
@@ -130,8 +104,10 @@ def _current_frame_hash() -> str:
     if sys.platform != "win32":
         return "non-windows"
     import hashlib
-    vw = user32.GetSystemMetrics(SM_CXVIRTUALSCREEN); vh = user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
-    vx = user32.GetSystemMetrics(SM_XVIRTUALSCREEN); vy = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+    vw = user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+    vh = user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+    vx = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+    vy = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
     return hashlib.sha256(f"{vx},{vy},{vw},{vh}".encode()).hexdigest()[:12]
 
 
@@ -148,7 +124,7 @@ def require_unlocked_desktop(func: F) -> F:
     return wrapper  # type: ignore
 
 
-# ─── Keyboard: special keys + Unicode helpers ──────────────────────────────
+# ─── Keyboard utility: VkKeyScanW + surrogate pairs ───────────────────────
 
 _SPECIAL_KEYS = {
     "enter": 0x0D, "return": 0x0D, "tab": 0x09, "escape": 0x1B, "esc": 0x1B,
@@ -165,53 +141,77 @@ _SPECIAL_KEYS = {
     "f9": 0x78, "f10": 0x79, "f11": 0x7A, "f12": 0x7B,
     "printscreen": 0x2C, "capslock": 0x14,
     "numlock": 0x90, "scrolllock": 0x91,
-    "apps": 0x5D, "browser_back": 0xA6, "browser_forward": 0xA7,
-    "volume_mute": 0xAD, "volume_down": 0xAE, "volume_up": 0xAF,
+    "apps": 0x5D, "sleep": 0x5F, "browser_back": 0xA6,
+    "browser_forward": 0xA7, "volume_mute": 0xAD,
+    "volume_down": 0xAE, "volume_up": 0xAF,
+    "media_next": 0xB0, "media_prev": 0xB1, "media_stop": 0xB2,
+    "media_play": 0xB3,
 }
 
 
-def _resolve_virtual_key(key: str) -> int:
-    """Resolve special key name → VK code. Returns -1 if not found."""
-    return _SPECIAL_KEYS.get(key.lower(), -1)
+def _resolve_virtual_key(key: str) -> Tuple[int, int]:
+    """Resolve key name or character to (vk_code, modifiers_flag).
+
+    Uses VkKeyScanW for letter/numeral/punctuation characters.
+    Returns (-1, 0) if the character is a surrogate/emoji (use Unicode input).
+    """
+    key_lower = key.lower()
+    if key_lower in _SPECIAL_KEYS:
+        return _SPECIAL_KEYS[key_lower], 0
+
+    if len(key) == 1:
+        try:
+            result = user32.VkKeyScanW(ord(key))
+        except Exception:
+            return -1, 0  # Fallback: use Unicode input
+        if result == -1 or result == 0xFFFF:
+            return -1, 0  # No VK mapping — use Unicode
+        vk = result & 0xFF
+        modifiers = (result >> 8) & 0xFF
+        return vk, modifiers
+
+    return -1, 0
 
 
 def _utf16_units(char: str) -> List[int]:
-    """Split a character into UTF-16 code units."""
+    """Split a character into UTF-16 code units (for surrogate pairs / emoji)."""
     raw = char.encode("utf-16-le")
-    return [int.from_bytes(raw[i:i + 2], "little") for i in range(0, len(raw), 2)]
+    return [
+        int.from_bytes(raw[i:i + 2], "little")
+        for i in range(0, len(raw), 2)
+    ]
 
 
-def _send_key_event(vk: int, flags: int) -> int:
+def _send_unicode_down_up(code_unit: int):
+    """Send a single UTF-16 code unit as Unicode key down + up."""
+    inp_down = INPUT()
+    inp_down.type = INPUT_KEYBOARD
+    inp_down.union.ki.wVk = 0
+    inp_down.union.ki.wScan = code_unit
+    inp_down.union.ki.dwFlags = KEYEVENTF_UNICODE
+    inp_down.union.ki.time = 0
+    inp_down.union.ki.dwExtraInfo = None
+
+    inp_up = INPUT()
+    inp_up.type = INPUT_KEYBOARD
+    inp_up.union.ki.wVk = 0
+    inp_up.union.ki.wScan = code_unit
+    inp_up.union.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
+    inp_up.union.ki.time = 0
+    inp_up.union.ki.dwExtraInfo = None
+
+    _send_input(inp_down, inp_up)
+
+
+def _send_key_event(vk: int, flags: int):
     inp = INPUT()
     inp.type = INPUT_KEYBOARD
-    inp.union.ki.wVk = vk; inp.union.ki.wScan = 0
-    inp.union.ki.dwFlags = flags; inp.union.ki.time = 0
-    inp.union.ki.dwExtraInfo = None
-    return _send_input(inp)
-
-
-def _send_unicode_key(code_unit: int, is_up: bool = False) -> int:
-    """Send one UTF-16 code unit as down or up."""
-    inp = INPUT()
-    inp.type = INPUT_KEYBOARD
-    inp.union.ki.wVk = 0
-    inp.union.ki.wScan = code_unit
-    inp.union.ki.dwFlags = KEYEVENTF_UNICODE | (KEYEVENTF_KEYUP if is_up else 0)
+    inp.union.ki.wVk = vk
+    inp.union.ki.wScan = 0
+    inp.union.ki.dwFlags = flags
     inp.union.ki.time = 0
     inp.union.ki.dwExtraInfo = None
-    return _send_input(inp)
-
-
-def _type_unicode_char(char: str) -> int:
-    """Type one character via KEYEVENTF_UNICODE (handles all scripts + emoji).
-    #2: Always use Unicode — no VkKeyScanW for text.
-    Returns total events inserted (should be 2 * len(units)).
-    """
-    total = 0
-    for unit in _utf16_units(char):
-        total += _send_unicode_key(unit, is_up=False)
-        total += _send_unicode_key(unit, is_up=True)
-    return total
+    _send_input(inp)
 
 
 # ─── WindowsAutomationHandler ──────────────────────────────────────────────
@@ -223,22 +223,21 @@ class WindowsAutomationHandler(BaseAutomationHandler):
             return False
         try:
             hdesk = user32.OpenInputDesktop(0, False, 0x0001)
-            if not hdesk: return True
-            user32.CloseDesktop(hdesk); return False
+            if not hdesk:
+                return True
+            user32.CloseDesktop(hdesk)
+            return False
         except Exception:
             return True
 
-    # ── Screenshots (#6: asyncio.to_thread) ────────────────────────────
+    # ── Screenshots ───────────────────────────────────────────────────
 
     @require_unlocked_desktop
     async def screenshot(self) -> Dict[str, Any]:
-        # #6: run blocking PIL grab in thread
-        def _grab():
+        try:
             img = ImageGrab.grab(all_screens=True)
             buf = BytesIO(); img.save(buf, format="PNG")
-            return img, base64.b64encode(buf.getvalue()).decode()
-        try:
-            img, encoded = await asyncio.to_thread(_grab)
+            encoded = base64.b64encode(buf.getvalue()).decode()
             vx = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
             vy = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
             vw = user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
@@ -250,34 +249,30 @@ class WindowsAutomationHandler(BaseAutomationHandler):
             return {"success": False, "error": str(e)}
 
     @require_unlocked_desktop
-    async def screenshot_region(self, x: int, y: int, w: int, h: int) -> Dict[str, Any]:
-        def _grab():
-            img = ImageGrab.grab(bbox=(x, y, x + w, y + h), all_screens=True)
-            buf = BytesIO(); img.save(buf, format="PNG")
-            return img, base64.b64encode(buf.getvalue()).decode()
+    async def screenshot_region(self, x: int, y: int, width: int, height: int) -> Dict[str, Any]:
         try:
-            img, encoded = await asyncio.to_thread(_grab)
+            img = ImageGrab.grab(bbox=(x, y, x + width, y + height), all_screens=True)
+            buf = BytesIO(); img.save(buf, format="PNG")
+            encoded = base64.b64encode(buf.getvalue()).decode()
             return {"success": True, "image_data": encoded,
-                    "left": x, "top": y, "width": w, "height": h,
+                    "left": x, "top": y, "width": width, "height": height,
                     "image_width": img.width, "image_height": img.height}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
     @require_unlocked_desktop
     async def screenshot_window(self, window_id: Optional[int] = None) -> Dict[str, Any]:
-        if window_id is None:
-            window_id = win32gui.GetForegroundWindow()
-        rect = win32gui.GetWindowRect(window_id)
-        left, top, right, bottom = rect
-        w, h = right - left, bottom - top
-        if w <= 0 or h <= 0:
-            return {"success": False, "error": f"Window {window_id} zero area", "fallback_used": False}
-        def _grab():
+        try:
+            if window_id is None:
+                window_id = win32gui.GetForegroundWindow()
+            rect = win32gui.GetWindowRect(window_id)
+            left, top, right, bottom = rect
+            w, h = right - left, bottom - top
+            if w <= 0 or h <= 0:
+                return {"success": False, "error": f"Window {window_id} zero area", "fallback_used": False}
             img = ImageGrab.grab(bbox=rect, all_screens=True)
             buf = BytesIO(); img.save(buf, format="PNG")
-            return img, base64.b64encode(buf.getvalue()).decode()
-        try:
-            img, encoded = await asyncio.to_thread(_grab)
+            encoded = base64.b64encode(buf.getvalue()).decode()
             return {"success": True, "image_data": encoded,
                     "left": left, "top": top, "width": w, "height": h,
                     "image_width": img.width, "image_height": img.height}
@@ -293,9 +288,9 @@ class WindowsAutomationHandler(BaseAutomationHandler):
         pt = win32api.GetCursorPos()
         return {"x": pt[0], "y": pt[1]}
 
-    # ── Mouse (#3: check SendInput) ───────────────────────────────────
+    # ── Mouse ─────────────────────────────────────────────────────────
 
-    def _send_mouse_checked(self, flags: int, x: int, y: int, data: int = 0) -> Dict[str, Any]:
+    def _send_mouse_event(self, flags: int, x: int = 0, y: int = 0, data: int = 0):
         nx, ny = _virtual_desktop_coords(x, y)
         inp = INPUT()
         inp.type = INPUT_MOUSE
@@ -303,18 +298,20 @@ class WindowsAutomationHandler(BaseAutomationHandler):
         inp.union.mi.mouseData = data
         inp.union.mi.dwFlags = flags | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
         inp.union.mi.time = 0; inp.union.mi.dwExtraInfo = None
-        return _send_input_checked(inp)
+        _send_input(inp)
 
     def _set_cursor_pos(self, x: int, y: int):
         win32api.SetCursorPos((x, y))
 
     async def mouse_down(self, x=None, y=None, button="left") -> Dict[str, Any]:
+        # PS: None,None = don't move cursor
         if x is not None and y is not None:
             self._set_cursor_pos(x, y)
         flags = {"left": MOUSEEVENTF_LEFTDOWN, "right": MOUSEEVENTF_RIGHTDOWN,
                  "middle": MOUSEEVENTF_MIDDLEDOWN}.get(button, MOUSEEVENTF_LEFTDOWN)
         px, py = win32api.GetCursorPos()
-        return self._send_mouse_checked(flags, px, py)
+        self._send_mouse_event(flags, px, py)
+        return {"success": True}
 
     async def mouse_up(self, x=None, y=None, button="left") -> Dict[str, Any]:
         if x is not None and y is not None:
@@ -322,208 +319,185 @@ class WindowsAutomationHandler(BaseAutomationHandler):
         flags = {"left": MOUSEEVENTF_LEFTUP, "right": MOUSEEVENTF_RIGHTUP,
                  "middle": MOUSEEVENTF_MIDDLEUP}.get(button, MOUSEEVENTF_LEFTUP)
         px, py = win32api.GetCursorPos()
-        return self._send_mouse_checked(flags, px, py)
+        self._send_mouse_event(flags, px, py)
+        return {"success": True}
 
     async def left_click(self, x=None, y=None) -> Dict[str, Any]:
         if x is not None and y is not None:
             self._set_cursor_pos(x, y)
         px, py = win32api.GetCursorPos()
-        r1 = self._send_mouse_checked(MOUSEEVENTF_LEFTDOWN, px, py)
+        self._send_mouse_event(MOUSEEVENTF_LEFTDOWN, px, py)
         await asyncio.sleep(0.01)
-        r2 = self._send_mouse_checked(MOUSEEVENTF_LEFTUP, px, py)
-        return {"success": r1["success"] and r2["success"]}
+        self._send_mouse_event(MOUSEEVENTF_LEFTUP, px, py)
+        return {"success": True}
 
     async def right_click(self, x=None, y=None) -> Dict[str, Any]:
         if x is not None and y is not None:
             self._set_cursor_pos(x, y)
         px, py = win32api.GetCursorPos()
-        r1 = self._send_mouse_checked(MOUSEEVENTF_RIGHTDOWN, px, py)
+        self._send_mouse_event(MOUSEEVENTF_RIGHTDOWN, px, py)
         await asyncio.sleep(0.01)
-        r2 = self._send_mouse_checked(MOUSEEVENTF_RIGHTUP, px, py)
-        return {"success": r1["success"] and r2["success"]}
+        self._send_mouse_event(MOUSEEVENTF_RIGHTUP, px, py)
+        return {"success": True}
 
     async def middle_click(self, x=None, y=None) -> Dict[str, Any]:
         if x is not None and y is not None:
             self._set_cursor_pos(x, y)
         px, py = win32api.GetCursorPos()
-        r1 = self._send_mouse_checked(MOUSEEVENTF_MIDDLEDOWN, px, py)
+        self._send_mouse_event(MOUSEEVENTF_MIDDLEDOWN, px, py)
         await asyncio.sleep(0.01)
-        r2 = self._send_mouse_checked(MOUSEEVENTF_MIDDLEUP, px, py)
-        return {"success": r1["success"] and r2["success"]}
+        self._send_mouse_event(MOUSEEVENTF_MIDDLEUP, px, py)
+        return {"success": True}
 
     async def double_click(self, x=None, y=None) -> Dict[str, Any]:
         await self.left_click(x, y)
         await asyncio.sleep(0.05)
-        return await self.left_click(x, y)
+        await self.left_click(x, y)
+        return {"success": True}
 
     async def move_cursor(self, x: int, y: int) -> Dict[str, Any]:
         self._set_cursor_pos(x, y)
         return {"success": True}
 
-    # #4: try/finally ensures mouse-up even on cancel
     async def drag_to(self, x: int, y: int, button="left", duration=0.5) -> Dict[str, Any]:
-        duration = max(0.05, min(float(duration), 10.0))
         start = win32api.GetCursorPos()
         flags_down = {"left": MOUSEEVENTF_LEFTDOWN, "right": MOUSEEVENTF_RIGHTDOWN,
                       "middle": MOUSEEVENTF_MIDDLEDOWN}.get(button, MOUSEEVENTF_LEFTDOWN)
         flags_up = {"left": MOUSEEVENTF_LEFTUP, "right": MOUSEEVENTF_RIGHTUP,
                     "middle": MOUSEEVENTF_MIDDLEUP}.get(button, MOUSEEVENTF_LEFTUP)
-
-        self._send_mouse_checked(flags_down, start[0], start[1])
-        try:
-            steps = max(2, int(duration * 60))
-            for i in range(1, steps + 1):
-                t = i / steps
-                ix = int(start[0] + (x - start[0]) * t)
-                iy = int(start[1] + (y - start[1]) * t)
-                self._set_cursor_pos(ix, iy)
-                await asyncio.sleep(duration / steps)
-        finally:
-            # #4: ALWAYS release mouse button
-            self._send_mouse_checked(flags_up, x, y)
+        self._send_mouse_event(flags_down, start[0], start[1])
+        steps = max(2, int(duration * 60))
+        for i in range(1, steps + 1):
+            t = i / steps
+            ix = int(start[0] + (x - start[0]) * t)
+            iy = int(start[1] + (y - start[1]) * t)
+            self._set_cursor_pos(ix, iy)
+            await asyncio.sleep(duration / steps)
+        self._send_mouse_event(flags_up, x, y)
         return {"success": True}
 
     async def scroll(self, scroll_x: int = 0, scroll_y: int = 0) -> Dict[str, Any]:
-        results = []
         if scroll_y:
             inp = INPUT(); inp.type = INPUT_MOUSE
             inp.union.mi.dwFlags = MOUSEEVENTF_WHEEL
             inp.union.mi.mouseData = scroll_y * 120
-            results.append(_send_input_checked(inp))
+            _send_input(inp)
         if scroll_x:
             inp = INPUT(); inp.type = INPUT_MOUSE
             inp.union.mi.dwFlags = MOUSEEVENTF_HWHEEL
             inp.union.mi.mouseData = scroll_x * 120
-            results.append(_send_input_checked(inp))
-        return {"success": all(r["success"] for r in results) if results else True}
+            _send_input(inp)
+        return {"success": True}
 
-    # ── Keyboard (#2: Unicode for text, #3: check insertion, #4: try/finally hotkey) ──
+    # ── Keyboard (VkKeyScanW resolver + surrogate pairs) ──────────────
 
     async def key_down(self, key: str) -> Dict[str, Any]:
-        vk = _resolve_virtual_key(key)
+        vk, mods = _resolve_virtual_key(key)
         if vk >= 0:
-            return _send_input_checked(INPUT() if False else _make_key_input(vk, KEYEVENTF_KEYDOWN))
+            _send_key_event(vk, KEYEVENTF_KEYDOWN)
+            return {"success": True}
+        # Unicode fallback: send ALL code units as keydown only
         if len(key) == 1:
-            results = [_send_input_checked(_make_unicode_input(unit, False))
-                       for unit in _utf16_units(key)]
-            return {"success": all(r["success"] for r in results)}
+            for unit in _utf16_units(key):
+                inp = INPUT()
+                inp.type = INPUT_KEYBOARD
+                inp.union.ki.wVk = 0
+                inp.union.ki.wScan = unit
+                inp.union.ki.dwFlags = KEYEVENTF_UNICODE
+                inp.union.ki.time = 0
+                inp.union.ki.dwExtraInfo = None
+                _send_input(inp)
+            return {"success": True}
         return {"success": False, "error": f"Unknown key: {key}"}
 
     async def key_up(self, key: str) -> Dict[str, Any]:
-        vk = _resolve_virtual_key(key)
+        vk, mods = _resolve_virtual_key(key)
         if vk >= 0:
-            return _send_input_checked(_make_key_input(vk, KEYEVENTF_KEYUP))
+            _send_key_event(vk, KEYEVENTF_KEYUP)
+            return {"success": True}
         if len(key) == 1:
-            results = [_send_input_checked(_make_unicode_input(unit, True))
-                       for unit in _utf16_units(key)]
-            return {"success": all(r["success"] for r in results)}
+            for unit in _utf16_units(key):
+                inp = INPUT()
+                inp.type = INPUT_KEYBOARD
+                inp.union.ki.wVk = 0
+                inp.union.ki.wScan = unit
+                inp.union.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
+                inp.union.ki.time = 0
+                inp.union.ki.dwExtraInfo = None
+                _send_input(inp)
+            return {"success": True}
         return {"success": False, "error": f"Unknown key: {key}"}
 
-    # #2: Unicode-only — no VkKeyScanW for text input
     async def type_text(self, text: str) -> Dict[str, Any]:
-        total_requested = 0; total_inserted = 0
-        for char in text:
-            vk = _resolve_virtual_key(char)
+        for ch in text:
+            vk, mods = _resolve_virtual_key(ch)
             if vk >= 0:
-                # Special key: down + up via VK
-                inserted = _send_key_event(vk, KEYEVENTF_KEYDOWN)
-                total_requested += 1; total_inserted += inserted
+                # Simple VK: down+up
+                _send_key_event(vk, KEYEVENTF_KEYDOWN)
                 await asyncio.sleep(0.005)
-                inserted = _send_key_event(vk, KEYEVENTF_KEYUP)
-                total_requested += 1; total_inserted += inserted
+                _send_key_event(vk, KEYEVENTF_KEYUP)
             else:
-                # #2: Unicode for ALL text characters (letters, digits, symbols, emoji)
-                units = _utf16_units(char)
-                for unit in units:
-                    inserted = _send_unicode_key(unit, is_up=False)
-                    total_requested += 1; total_inserted += inserted
-                await asyncio.sleep(0.002)
-                for unit in units:
-                    inserted = _send_unicode_key(unit, is_up=True)
-                    total_requested += 1; total_inserted += inserted
+                # Unicode: send each UTF-16 code unit as down+up pair
+                for unit in _utf16_units(ch):
+                    _send_unicode_down_up(unit)
+                    await asyncio.sleep(0.002)
             await asyncio.sleep(0.005)
-        ok = total_inserted == total_requested
-        return {"success": ok, "requested": total_requested, "inserted": total_inserted}
+        return {"success": True}
 
     async def press_key(self, key: str) -> Dict[str, Any]:
-        vk = _resolve_virtual_key(key)
+        vk, mods = _resolve_virtual_key(key)
         if vk >= 0:
-            r1 = _send_input_checked(_make_key_input(vk, KEYEVENTF_KEYDOWN))
+            _send_key_event(vk, KEYEVENTF_KEYDOWN)
             await asyncio.sleep(0.02)
-            r2 = _send_input_checked(_make_key_input(vk, KEYEVENTF_KEYUP))
-            return {"success": r1["success"] and r2["success"]}
+            _send_key_event(vk, KEYEVENTF_KEYUP)
+            return {"success": True}
         if len(key) == 1:
-            inserted = _type_unicode_char(key)
-            return {"success": inserted == 2 * len(_utf16_units(key)),
-                    "inserted": inserted}
+            for unit in _utf16_units(key):
+                _send_unicode_down_up(unit)
+            return {"success": True}
         return {"success": False, "error": f"Unknown key: {key}"}
 
-    # #4: try/finally ensures all keys released
     async def hotkey(self, keys: List[str]) -> Dict[str, Any]:
         resolved = []
         for key in keys:
-            vk = _resolve_virtual_key(key)
+            vk, mods = _resolve_virtual_key(key)
             if vk >= 0:
                 resolved.append(vk)
-        if not resolved:
-            return {"success": False, "error": "No resolvable keys"}
-
+            else:
+                # Non-VK key in hotkey — send as Unicode (best effort)
+                pass
         for vk in resolved:
             _send_key_event(vk, KEYEVENTF_KEYDOWN)
             await asyncio.sleep(0.01)
-        try:
-            await asyncio.sleep(0.05)
-        finally:
-            # #4: release ALL keys in reverse, even if cancelled
-            for vk in reversed(resolved):
-                _send_key_event(vk, KEYEVENTF_KEYUP)
-                await asyncio.sleep(0.01)
-        return {"success": True}
-
-    # ── Input state release (emergency tool) ──────────────────────────
-
-    async def release_input_state(self) -> Dict[str, Any]:
-        """Emergency: release all modifier keys + mouse buttons."""
-        modifiers = [0x10, 0x11, 0x12, 0x5B, 0x5C]  # Shift, Ctrl, Alt, LWin, RWin
-        for vk in modifiers:
+        for vk in reversed(resolved):
             _send_key_event(vk, KEYEVENTF_KEYUP)
-            await asyncio.sleep(0.005)
-
-        mouse_flags = [MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_MIDDLEUP]
-        px, py = win32api.GetCursorPos()
-        for flags in mouse_flags:
-            self._send_mouse_checked(flags, px, py)
-            await asyncio.sleep(0.005)
+            await asyncio.sleep(0.01)
         return {"success": True}
 
     # ── Clipboard ─────────────────────────────────────────────────────
 
     async def copy_to_clipboard(self) -> Dict[str, Any]:
-        def _get():
+        try:
             win32clipboard.OpenClipboard()
             try:
                 if win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_UNICODETEXT):
-                    return win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
-                return ""
+                    data = win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
+                    return {"success": True, "text": data}
+                return {"success": True, "text": ""}
             finally:
                 win32clipboard.CloseClipboard()
-        try:
-            data = await asyncio.to_thread(_get)
-            return {"success": True, "text": data}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
     async def set_clipboard(self, text: str) -> Dict[str, Any]:
-        def _set():
+        try:
             win32clipboard.OpenClipboard()
             try:
                 win32clipboard.EmptyClipboard()
                 win32clipboard.SetClipboardText(text, win32clipboard.CF_UNICODETEXT)
+                return {"success": True}
             finally:
                 win32clipboard.CloseClipboard()
-        try:
-            await asyncio.to_thread(_set)
-            return {"success": True}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -588,22 +562,35 @@ class WindowsAutomationHandler(BaseAutomationHandler):
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    async def minimize_window(self, window_id: int): win32gui.ShowWindow(window_id, win32con.SW_MINIMIZE); return {"success": True}
-    async def maximize_window(self, window_id: int): win32gui.ShowWindow(window_id, win32con.SW_MAXIMIZE); return {"success": True}
-    async def restore_window(self, window_id: int): win32gui.ShowWindow(window_id, win32con.SW_RESTORE); return {"success": True}
-    async def close_window(self, window_id: int): win32gui.PostMessage(window_id, win32con.WM_CLOSE, 0, 0); return {"success": True}
+    async def minimize_window(self, window_id: int) -> Dict[str, Any]:
+        win32gui.ShowWindow(window_id, win32con.SW_MINIMIZE)
+        return {"success": True}
 
-    # ── Activate Window ───────────────────────────────────────────────
+    async def maximize_window(self, window_id: int) -> Dict[str, Any]:
+        win32gui.ShowWindow(window_id, win32con.SW_MAXIMIZE)
+        return {"success": True}
+
+    async def restore_window(self, window_id: int) -> Dict[str, Any]:
+        win32gui.ShowWindow(window_id, win32con.SW_RESTORE)
+        return {"success": True}
+
+    async def close_window(self, window_id: int) -> Dict[str, Any]:
+        win32gui.PostMessage(window_id, win32con.WM_CLOSE, 0, 0)
+        return {"success": True}
+
+    # ── Activate Window (P0: GetWindowThreadProcessId fix) ────────────
 
     async def activate_window(self, window_id: int) -> Dict[str, Any]:
         try:
             if win32gui.IsIconic(window_id):
                 win32gui.ShowWindow(window_id, win32con.SW_RESTORE)
             win32gui.ShowWindow(window_id, win32con.SW_SHOW)
+
             fg_set = win32gui.SetForegroundWindow(window_id)
             if not fg_set:
                 fg_hwnd = win32gui.GetForegroundWindow()
                 if fg_hwnd:
+                    # PS: GetWindowThreadProcessId returns (thread_id, process_id) tuple
                     cur_tid, _ = win32process.GetWindowThreadProcessId(fg_hwnd)
                     tgt_tid, _ = win32process.GetWindowThreadProcessId(window_id)
                     if cur_tid and tgt_tid and cur_tid != tgt_tid:
@@ -615,39 +602,41 @@ class WindowsAutomationHandler(BaseAutomationHandler):
                             user32.AttachThreadInput(cur_tid, tgt_tid, False)
                 else:
                     win32gui.BringWindowToTop(window_id)
+
             await asyncio.sleep(0.1)
             actual_fg = win32gui.GetForegroundWindow()
             fg_verified = (actual_fg == window_id)
-            return {"success": fg_verified, "foreground_verified": fg_verified,
-                    "foreground_window": actual_fg, "target_window": window_id,
-                    "error": None if fg_verified else "Foreground window mismatch"}
+
+            # PS: only report success if actually verified
+            return {
+                "success": fg_verified,
+                "foreground_verified": fg_verified,
+                "foreground_window": actual_fg,
+                "target_window": window_id,
+                "error": None if fg_verified else "Foreground window mismatch after activation",
+            }
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    # ── Processes (#6: asyncio.to_thread) ─────────────────────────────
+    # ── Processes ────────────────────────────────────────────────────
 
     async def list_processes(self) -> Dict[str, Any]:
         if psutil is None:
             return {"success": False, "error": "psutil not installed"}
-        def _list():
-            procs = []
-            for proc in psutil.process_iter(["pid", "name", "exe"]):
-                try:
-                    info = proc.info
-                    procs.append({"pid": info["pid"], "name": info["name"] or "", "exe": info["exe"] or ""})
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
-            return procs
-        procs = await asyncio.to_thread(_list)
+        procs = []
+        for proc in psutil.process_iter(["pid", "name", "exe"]):
+            try:
+                info = proc.info
+                procs.append({"pid": info["pid"], "name": info["name"] or "", "exe": info["exe"] or ""})
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
         return {"processes": procs}
 
     async def kill_process(self, pid: int) -> Dict[str, Any]:
-        def _kill():
+        try:
             proc = psutil.Process(pid)
             proc.terminate()
             proc.wait(timeout=5)
-        try:
-            await asyncio.to_thread(_kill)
             return {"success": True, "pid": pid}
         except psutil.NoSuchProcess:
             return {"success": False, "error": f"Process {pid} not found"}
@@ -656,33 +645,37 @@ class WindowsAutomationHandler(BaseAutomationHandler):
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    # ── Registry (#6: asyncio.to_thread) ──────────────────────────────
+    # ── Registry ──────────────────────────────────────────────────────
 
-    _ROOT_MAP = {"HKCU": winreg.HKEY_CURRENT_USER, "HKLM": winreg.HKEY_LOCAL_MACHINE,
-                 "HKCR": winreg.HKEY_CLASSES_ROOT, "HKU": winreg.HKEY_USERS,
-                 "HKCC": winreg.HKEY_CURRENT_CONFIG}
-    _REG_TYPE_MAP = {"REG_SZ": winreg.REG_SZ, "REG_DWORD": winreg.REG_DWORD,
-                     "REG_QWORD": winreg.REG_QWORD, "REG_BINARY": winreg.REG_BINARY}
+    _ROOT_MAP = {
+        "HKCU": winreg.HKEY_CURRENT_USER, "HKLM": winreg.HKEY_LOCAL_MACHINE,
+        "HKCR": winreg.HKEY_CLASSES_ROOT, "HKU": winreg.HKEY_USERS,
+        "HKCC": winreg.HKEY_CURRENT_CONFIG,
+        "HKEY_CURRENT_USER": winreg.HKEY_CURRENT_USER,
+        "HKEY_LOCAL_MACHINE": winreg.HKEY_LOCAL_MACHINE,
+    }
+    _REG_TYPE_MAP = {
+        "REG_SZ": winreg.REG_SZ, "REG_DWORD": winreg.REG_DWORD,
+        "REG_QWORD": winreg.REG_QWORD, "REG_BINARY": winreg.REG_BINARY,
+        "REG_EXPAND_SZ": winreg.REG_EXPAND_SZ, "REG_MULTI_SZ": winreg.REG_MULTI_SZ,
+    }
 
     def _parse_reg_path(self, key_path: str) -> Tuple[Any, str]:
         for prefix, root in self._ROOT_MAP.items():
             if key_path.upper().startswith(prefix.upper()):
                 return root, key_path[len(prefix):].lstrip("\\")
-        logger.warning(f"Unknown registry root in '{key_path}', defaulting HKCU")
+        logger.warning(f"Unknown registry root in '{key_path}', defaulting to HKCU")
         return winreg.HKEY_CURRENT_USER, key_path
 
     async def registry_read(self, key_path: str, value_name: str = "") -> Dict[str, Any]:
-        def _read():
+        try:
             root, subkey = self._parse_reg_path(key_path)
             key = winreg.OpenKey(root, subkey, 0, winreg.KEY_READ)
             try:
                 value, reg_type = winreg.QueryValueEx(key, value_name or None)
-                return value, reg_type
+                return {"success": True, "value": value, "type": reg_type}
             finally:
                 winreg.CloseKey(key)
-        try:
-            value, reg_type = await asyncio.to_thread(_read)
-            return {"success": True, "value": value, "type": reg_type}
         except FileNotFoundError:
             return {"success": False, "error": f"Key not found: {key_path}"}
         except Exception as e:
@@ -690,72 +683,79 @@ class WindowsAutomationHandler(BaseAutomationHandler):
 
     async def registry_write(self, key_path: str, value_name: str, value: str,
                               reg_type: str = "REG_SZ") -> Dict[str, Any]:
-        def _write():
+        try:
             root, subkey = self._parse_reg_path(key_path)
             actual_type = self._REG_TYPE_MAP.get(reg_type.upper(), winreg.REG_SZ)
             if actual_type in (winreg.REG_DWORD, winreg.REG_QWORD):
-                value_int = int(value)
-            else:
-                value_int = value
+                value = int(value)
             key = winreg.CreateKey(root, subkey)
             try:
-                winreg.SetValueEx(key, value_name, 0, actual_type, value_int if actual_type in (winreg.REG_DWORD, winreg.REG_QWORD) else value)
+                winreg.SetValueEx(key, value_name, 0, actual_type, value)
+                return {"success": True}
             finally:
                 winreg.CloseKey(key)
-        try:
-            await asyncio.to_thread(_write)
-            return {"success": True}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    # ── Services (#6: asyncio.to_thread) ──────────────────────────────
+    # ── Services ──────────────────────────────────────────────────────
 
     async def list_services(self) -> Dict[str, Any]:
-        def _list():
+        try:
             scm = win32service.OpenSCManager(None, None, win32service.SC_MANAGER_ENUMERATE_SERVICE)
             try:
                 services = win32service.EnumServicesStatus(scm)
-                return [{"name": s[0], "display_name": s[1], "status": s[2][1]} for s in services]
+                return {"services": [{"name": s[0], "display_name": s[1], "status": s[2][1]} for s in services]}
             finally:
                 win32service.CloseServiceHandle(scm)
-        try:
-            result = await asyncio.to_thread(_list)
-            return {"services": result}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    async def _svc_op(self, name: str, access: int, op: Callable) -> Dict[str, Any]:
-        def _do():
-            scm = win32service.OpenSCManager(None, None, win32service.SC_MANAGER_CONNECT)
-            try:
-                svc = win32service.OpenService(scm, name, access)
-                try:
-                    return op(svc)
-                finally:
-                    win32service.CloseServiceHandle(svc)
-            finally:
-                win32service.CloseServiceHandle(scm)
+    def _open_service(self, name: str, access: int):
+        scm = win32service.OpenSCManager(None, None, win32service.SC_MANAGER_CONNECT)
         try:
-            result = await asyncio.to_thread(_do)
-            return {"success": True, "name": name, **result}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+            return win32service.OpenService(scm, name, access)
+        finally:
+            win32service.CloseServiceHandle(scm)
 
     async def service_status(self, name: str) -> Dict[str, Any]:
-        def _status(svc):
-            status = win32service.QueryServiceStatus(svc)
-            names = {1: "stopped", 2: "start_pending", 3: "stop_pending",
-                     4: "running", 5: "continue_pending", 6: "pause_pending", 7: "paused"}
-            return {"state": names.get(status[1], f"unknown({status[1]})")}
-        return await self._svc_op(name, win32service.SERVICE_QUERY_STATUS, _status)
+        try:
+            svc = self._open_service(name, win32service.SERVICE_QUERY_STATUS)
+            try:
+                status = win32service.QueryServiceStatus(svc)
+                state_names = {
+                    win32service.SERVICE_STOPPED: "stopped", win32service.SERVICE_RUNNING: "running",
+                    win32service.SERVICE_START_PENDING: "start_pending",
+                    win32service.SERVICE_STOP_PENDING: "stop_pending",
+                    win32service.SERVICE_PAUSED: "paused",
+                }
+                return {"success": True, "name": name,
+                        "state": state_names.get(status[1], f"unknown({status[1]})")}
+            finally:
+                win32service.CloseServiceHandle(svc)
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
     async def service_start(self, name: str) -> Dict[str, Any]:
-        return await self._svc_op(name, win32service.SERVICE_START,
-                                   lambda svc: (win32service.StartService(svc, []), {})[1])
+        try:
+            svc = self._open_service(name, win32service.SERVICE_START)
+            try:
+                win32service.StartService(svc, [])
+                return {"success": True, "name": name}
+            finally:
+                win32service.CloseServiceHandle(svc)
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
     async def service_stop(self, name: str) -> Dict[str, Any]:
-        return await self._svc_op(name, win32service.SERVICE_STOP,
-                                   lambda svc: (win32service.ControlService(svc, win32service.SERVICE_CONTROL_STOP), {})[1])
+        try:
+            svc = self._open_service(name, win32service.SERVICE_STOP)
+            try:
+                win32service.ControlService(svc, win32service.SERVICE_CONTROL_STOP)
+                return {"success": True, "name": name}
+            finally:
+                win32service.CloseServiceHandle(svc)
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
     async def service_restart(self, name: str) -> Dict[str, Any]:
         try:
@@ -771,47 +771,26 @@ class WindowsAutomationHandler(BaseAutomationHandler):
         info = {"platform": sys.platform, "os": platform.platform(),
                 "hostname": platform.node(), "python": sys.version}
         if sys.platform == "win32":
-            try: info["monitor_count"] = user32.GetSystemMetrics(80)
-            except: pass
+            try:
+                info["monitor_count"] = user32.GetSystemMetrics(80)
+            except Exception:
+                pass
             info["uia_available"] = _HAS_UIA
-            info["dpi_initialized"] = _dpi_initialized
         return info
 
     async def get_file_permissions(self, path: str) -> Dict[str, Any]:
-        def _get():
+        try:
             sd = win32security.GetFileSecurity(
                 path, win32security.OWNER_SECURITY_INFORMATION |
                 win32security.GROUP_SECURITY_INFORMATION | win32security.DACL_SECURITY_INFORMATION)
             owner_sid = sd.GetSecurityDescriptorOwner()
             owner_name, _, _ = win32security.LookupAccountSid(None, owner_sid)
-            return owner_name
-        try:
-            owner = await asyncio.to_thread(_get)
-            return {"success": True, "owner": owner, "path": path}
+            return {"success": True, "owner": owner_name, "path": path}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
 
-# ─── UIA helper: make KEYBDINPUT from VK ───────────────────────────────────
-
-def _make_key_input(vk: int, flags: int) -> INPUT:
-    inp = INPUT()
-    inp.type = INPUT_KEYBOARD
-    inp.union.ki.wVk = vk; inp.union.ki.wScan = 0
-    inp.union.ki.dwFlags = flags; inp.union.ki.time = 0
-    inp.union.ki.dwExtraInfo = None
-    return inp
-
-def _make_unicode_input(code_unit: int, is_up: bool) -> INPUT:
-    inp = INPUT()
-    inp.type = INPUT_KEYBOARD
-    inp.union.ki.wVk = 0; inp.union.ki.wScan = code_unit
-    inp.union.ki.dwFlags = KEYEVENTF_UNICODE | (KEYEVENTF_KEYUP if is_up else 0)
-    inp.union.ki.time = 0; inp.union.ki.dwExtraInfo = None
-    return inp
-
-
-# ─── WindowsAccessibilityHandler (#1: recursive always, #6: to_thread) ─────
+# ─── WindowsAccessibilityHandler ──────────────────────────────────────────
 
 class WindowsAccessibilityHandler(BaseAccessibilityHandler):
     _element_registry: Dict[str, Any] = {}
@@ -836,38 +815,31 @@ class WindowsAccessibilityHandler(BaseAccessibilityHandler):
         return el
 
     async def get_accessibility_tree(self) -> Dict[str, Any]:
-        def _tree():
-            windows = []
-            def child_cb(hwnd_c, lst):
-                lst.append({"window_id": hwnd_c, "title": win32gui.GetWindowText(hwnd_c),
-                            "class": win32gui.GetClassName(hwnd_c)})
-            win32gui.EnumChildWindows(win32gui.GetDesktopWindow(), child_cb, windows)
-            return windows
-        windows = await asyncio.to_thread(_tree)
+        windows = []
+        def child_cb(hwnd_c, lst):
+            lst.append({"window_id": hwnd_c, "title": win32gui.GetWindowText(hwnd_c),
+                        "class": win32gui.GetClassName(hwnd_c)})
+        win32gui.EnumChildWindows(win32gui.GetDesktopWindow(), child_cb, windows)
         return {"windows": windows}
 
     async def find_element(self, role=None, title=None) -> Dict[str, Any]:
-        def _find():
-            results = []
-            def cb(hwnd, _):
-                t = win32gui.GetWindowText(hwnd); c = win32gui.GetClassName(hwnd)
-                if title and title.lower() not in t.lower(): return
-                if role and role.lower() not in c.lower(): return
-                results.append({"window_id": hwnd, "title": t, "class": c})
-            win32gui.EnumWindows(cb, None)
-            return results
-        elements = await asyncio.to_thread(_find)
-        return {"elements": elements}
+        results = []
+        def cb(hwnd, _):
+            t = win32gui.GetWindowText(hwnd); c = win32gui.GetClassName(hwnd)
+            if title and title.lower() not in t.lower(): return
+            if role and role.lower() not in c.lower(): return
+            results.append({"window_id": hwnd, "title": t, "class": c})
+        win32gui.EnumWindows(cb, None)
+        return {"elements": results}
 
-    # #1: FIXED — traverse children ALWAYS, match independently
     async def get_ui_tree(self, max_depth: int = 5) -> Dict[str, Any]:
         if not _HAS_UIA:
             return {"success": False, "error": "uiautomation not installed"}
-        def _tree():
+        try:
             root = auto.GetRootControl()
-            return self._build_tree(root, max_depth)
-        result = await asyncio.to_thread(_tree)
-        return {"success": True, "tree": result}
+            return {"success": True, "tree": self._build_tree(root, max_depth)}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
     def _build_tree(self, control, max_depth: int, depth: int = 0) -> Dict[str, Any]:
         if depth >= max_depth:
@@ -878,154 +850,119 @@ class WindowsAccessibilityHandler(BaseAccessibilityHandler):
                 "control_type": control.ControlTypeName, "name": control.Name,
                 "automation_id": control.AutomationId, "class_name": control.ClassName,
                 "enabled": control.IsEnabled,
+                "visible": not control.IsOffscreen if hasattr(control, "IsOffscreen") else True,
             }
-            children = []
-            try:
-                for child in control.GetChildren():
-                    children.append(self._build_tree(child, max_depth, depth + 1))
-            except Exception:
-                pass
-            if children:
-                node["children"] = children
+            if depth < max_depth - 1:
+                children = []
+                try:
+                    for child in control.GetChildren():
+                        children.append(self._build_tree(child, max_depth, depth + 1))
+                except Exception:
+                    pass
+                if children:
+                    node["children"] = children
             return node
         except Exception:
             return {"_error": "Could not read control"}
 
-    # #1: FIXED — children always traversed, match checked independently
     async def find_ui_elements(self, control_type=None, name=None, automation_id=None,
-                                class_name=None, max_results=50, max_depth=8) -> Dict[str, Any]:
+                                class_name=None) -> Dict[str, Any]:
         if not _HAS_UIA:
             return {"success": False, "error": "uiautomation not installed"}
-        def _find():
+        try:
             results = []
-            visited = [0]
             root = auto.GetRootControl()
-
-            def search(control, depth=0):
-                if visited[0] >= 5000 or depth > max_depth or len(results) >= max_results:
-                    return
-                visited[0] += 1
-
+            def search(control):
                 try:
-                    ct = control.ControlTypeName or ""
-                    nm = control.Name or ""
-                    aid = control.AutomationId or ""
-                    cn = control.ClassName or ""
+                    ct = control.ControlTypeName; nm = control.Name
+                    aid = control.AutomationId; cn = control.ClassName
                 except Exception:
                     return
-
-                # #1: check match independently of traversal
-                matches = (
-                    (not control_type or control_type.casefold() == ct.casefold()) and
-                    (not name or name.casefold() in nm.casefold()) and
-                    (not automation_id or automation_id == aid) and
-                    (not class_name or class_name.casefold() in cn.casefold())
-                )
-                if matches:
-                    eid = self._register_element(control)
-                    results.append({
-                        "element_id": eid, "control_type": ct, "name": nm,
-                        "automation_id": aid, "class_name": cn,
-                        "enabled": control.IsEnabled,
-                    })
-
-                # #1: ALWAYS traverse children (not conditional on match)
+                if control_type and control_type.lower() != ct.lower(): return
+                if name and name.lower() not in nm.lower(): return
+                if automation_id and automation_id != aid: return
+                if class_name and class_name.lower() not in cn.lower(): return
+                eid = self._register_element(control)
+                results.append({"element_id": eid, "control_type": ct, "name": nm,
+                                "automation_id": aid, "class_name": cn, "enabled": control.IsEnabled})
                 try:
                     for child in control.GetChildren():
-                        if len(results) >= max_results:
-                            return
-                        search(child, depth + 1)
+                        search(child)
                 except Exception:
                     pass
-
             search(root)
-            return results
-
-        elements = await asyncio.to_thread(_find)
-        return {"success": True, "elements": elements}
+            return {"success": True, "elements": results}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
     async def focus_ui_element(self, element_id: str) -> Dict[str, Any]:
-        el = self._get_element(element_id)
-        await asyncio.to_thread(el.SetFocus)
+        el = self._get_element(element_id); el.SetFocus()
         return {"success": True}
 
     async def invoke_ui_element(self, element_id: str) -> Dict[str, Any]:
         el = self._get_element(element_id)
-        def _invoke():
-            try:
-                pattern = el.GetInvokePattern()
-                if pattern:
-                    pattern.Invoke()
-                    return "InvokePattern"
-            except Exception:
-                pass
-            el.Click()
-            return "Click"
-        method = await asyncio.to_thread(_invoke)
-        return {"success": True, "method": method}
+        try:
+            pattern = el.GetInvokePattern()
+            if pattern:
+                pattern.Invoke()
+                return {"success": True, "method": "InvokePattern"}
+        except Exception:
+            pass
+        el.Click()
+        return {"success": True, "method": "Click"}
 
     async def set_ui_value(self, element_id: str, value: str) -> Dict[str, Any]:
         el = self._get_element(element_id)
-        def _set():
-            try:
-                pattern = el.GetValuePattern()
-                if pattern:
-                    pattern.SetValue(value)
-                    return "ValuePattern"
-            except Exception:
-                pass
-            el.SetFocus()
-            auto.SendKeys(value)
-            return "sendkeys_fallback"
-        method = await asyncio.to_thread(_set)
-        return {"success": True, "method": method}
+        try:
+            pattern = el.GetValuePattern()
+            if pattern:
+                pattern.SetValue(value)
+                return {"success": True}
+        except Exception:
+            pass
+        el.SetFocus(); auto.SendKeys(value)
+        return {"success": True, "method": "sendkeys_fallback"}
 
     async def toggle_ui_element(self, element_id: str) -> Dict[str, Any]:
         el = self._get_element(element_id)
-        def _toggle():
-            pattern = el.GetTogglePattern()
-            if pattern: pattern.Toggle(); return True
-            return False
-        ok = await asyncio.to_thread(_toggle)
-        return {"success": ok, "error": None if ok else "No TogglePattern"}
+        pattern = el.GetTogglePattern()
+        if pattern:
+            pattern.Toggle(); return {"success": True}
+        return {"success": False, "error": "No TogglePattern"}
 
     async def select_ui_element(self, element_id: str) -> Dict[str, Any]:
         el = self._get_element(element_id)
-        def _sel():
-            try:
-                pattern = el.GetSelectionItemPattern()
-                if pattern: pattern.Select(); return "SelectionItemPattern"
-            except: pass
-            el.Click(); return "click_fallback"
-        method = await asyncio.to_thread(_sel)
-        return {"success": True, "method": method}
+        try:
+            pattern = el.GetSelectionItemPattern()
+            if pattern:
+                pattern.Select(); return {"success": True}
+        except Exception:
+            pass
+        el.Click(); return {"success": True, "method": "click_fallback"}
 
     async def expand_ui_element(self, element_id: str) -> Dict[str, Any]:
         el = self._get_element(element_id)
-        def _exp():
-            pattern = el.GetExpandCollapsePattern()
-            if pattern: pattern.Expand(); return True
-            return False
-        ok = await asyncio.to_thread(_exp)
-        return {"success": ok, "error": None if ok else "No ExpandCollapsePattern"}
+        pattern = el.GetExpandCollapsePattern()
+        if pattern:
+            pattern.Expand(); return {"success": True}
+        return {"success": False, "error": "No ExpandCollapsePattern"}
 
     async def scroll_ui_element_into_view(self, element_id: str) -> Dict[str, Any]:
         el = self._get_element(element_id)
-        def _scroll():
-            try:
-                pattern = el.GetScrollItemPattern()
-                if pattern: pattern.ScrollIntoView(); return "ScrollItemPattern"
-            except: pass
-            el.SetFocus(); return "focus_fallback"
-        method = await asyncio.to_thread(_scroll)
-        return {"success": True, "method": method}
+        try:
+            pattern = el.GetScrollItemPattern()
+            if pattern:
+                pattern.ScrollIntoView(); return {"success": True}
+        except Exception:
+            pass
+        el.SetFocus(); return {"success": True, "method": "focus_fallback"}
 
     async def wait_for_ui_element(self, control_type=None, name=None, timeout_ms=5000) -> Dict[str, Any]:
         if not _HAS_UIA:
             return {"success": False, "error": "uiautomation not installed"}
         deadline = time.time() + timeout_ms / 1000.0
         while time.time() < deadline:
-            result = await self.find_ui_elements(control_type=control_type, name=name, max_results=1)
+            result = await self.find_ui_elements(control_type=control_type, name=name)
             if result.get("elements"):
                 return {"success": True, "found": True, "elements": result["elements"]}
             await asyncio.sleep(0.1)
@@ -1036,49 +973,32 @@ class WindowsAccessibilityHandler(BaseAccessibilityHandler):
 
 class WindowsFileHandler(BaseFileHandler):
     async def read_text(self, path: str) -> Dict[str, Any]:
-        def _read():
-            with open(path, "r", encoding="utf-8") as f:
-                return f.read(1_000_000)
         try:
-            content = await asyncio.to_thread(_read)
-            return {"success": True, "content": content}
+            with open(path, "r", encoding="utf-8") as f:
+                return {"success": True, "content": f.read()}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
     async def write_text(self, path: str, content: str) -> Dict[str, Any]:
-        def _write():
-            dirname = os.path.dirname(path) or "."
-            tmp = path + ".tmp." + str(uuid.uuid4().hex[:8]) if 'uuid' in dir() else path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.write(content)
-            os.replace(tmp, path)
         try:
-            import uuid as _uuid
-            await asyncio.to_thread(_write)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
             return {"success": True}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
     async def read_bytes(self, path: str, offset=0, length=None) -> Dict[str, Any]:
-        def _read():
-            with open(path, "rb") as f:
-                f.seek(offset)
-                data = f.read(length or 10_000_000)
-            return base64.b64encode(data).decode()
         try:
-            encoded = await asyncio.to_thread(_read)
-            return {"success": True, "data_base64": encoded}
+            with open(path, "rb") as f:
+                f.seek(offset); data = f.read(length) if length else f.read()
+                return {"success": True, "data_base64": base64.b64encode(data).decode()}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
     async def write_bytes(self, path: str, content: bytes) -> Dict[str, Any]:
-        def _write():
-            tmp = path + ".tmp"
-            with open(tmp, "wb") as f:
-                f.write(content)
-            os.replace(tmp, path)
         try:
-            await asyncio.to_thread(_write)
+            with open(path, "wb") as f:
+                f.write(content)
             return {"success": True}
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -1090,11 +1010,8 @@ class WindowsFileHandler(BaseFileHandler):
         return {"success": True, "exists": os.path.isdir(path)}
 
     async def list_dir(self, path: str) -> Dict[str, Any]:
-        def _list():
-            return os.listdir(path)[:1000]
         try:
-            items = await asyncio.to_thread(_list)
-            return {"success": True, "items": items}
+            return {"success": True, "items": os.listdir(path)}
         except Exception as e:
             return {"success": False, "error": str(e)}
 

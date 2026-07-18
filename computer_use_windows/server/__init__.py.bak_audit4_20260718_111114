@@ -90,7 +90,9 @@ PROFILES = {
         CAPABILITY_SCOPES["observe"] |
         CAPABILITY_SCOPES["desktop.input"] |
         CAPABILITY_SCOPES["desktop.windows"] |
-        CAPABILITY_SCOPES["desktop.uia"]
+        CAPABILITY_SCOPES["desktop.uia"] |
+        CAPABILITY_SCOPES["files.read"] |
+        CAPABILITY_SCOPES["files.write"]
     ),
 
     "files": (
@@ -358,7 +360,7 @@ def create_server() -> FastMCP:
     mcp = FastMCP(
         "Computer Use Windows",
         instructions="Windows desktop control via MCP — mouse, keyboard, UIA, files, system",
-        version="2.1.2",
+        version="2.1.1",
     )
 
     # ─── Helper: tool registration with annotations ────────────────────
@@ -523,13 +525,6 @@ def create_server() -> FastMCP:
     async def computer_key_up(key: str) -> Dict[str, Any]:
         async with _PROCESS_INPUT_LOCK:
             return await a.key_up(key)
-
-    @_tool(destructiveHint=True)
-    @require_capability("mouse_up")
-    async def computer_release_input_state() -> Dict[str, Any]:
-        """Emergency: release all modifier keys (Shift/Ctrl/Alt/Win) + mouse buttons."""
-        async with _PROCESS_INPUT_LOCK:
-            return await a.release_input_state()
 
     # ═══════════ Clipboard ════════════════════════════════════════════════
 
@@ -821,9 +816,17 @@ def create_server() -> FastMCP:
 # ─── Entry Points ──────────────────────────────────────────────────────────
 
 def enable_dpi_awareness() -> None:
-    """DEPRECATED: use handlers.initialize_windows_runtime() instead."""
-    from ..handlers.windows import initialize_windows_runtime
-    initialize_windows_runtime()
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        ok = user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+        if not ok:
+            raise ctypes.WinError()
+        logger.info("DPI: Per-Monitor V2 enabled")
+    except Exception as e:
+        logger.warning(f"DPI awareness failed: {e}")
 
 
 async def _serve() -> None:
