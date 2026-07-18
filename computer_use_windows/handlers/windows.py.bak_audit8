@@ -172,7 +172,8 @@ _SPECIAL_KEYS = {
 }
 
 # P0: tracked held keys for emergency release
-_HELD_KEYS_GLOBAL: set = set()  # used in release_input_state
+_HELD_KEYS: List[int] = []
+_HELD_BUTTONS: List[str] = []
 
 def _resolve_physical_key(key: str) -> int:
     """Resolve a physical key name → virtual key code.
@@ -329,7 +330,7 @@ class WindowsAutomationHandler(BaseAutomationHandler):
         px, py = win32api.GetCursorPos()
         result = self._send_mouse_checked(flags, px, py)
         if result["success"]:
-            _HELD_BUTTONS.add(button)
+            _HELD_BUTTONS.append(button)
         return result
 
     _MOUSE_UP = {"left": MOUSEEVENTF_LEFTUP, "right": MOUSEEVENTF_RIGHTUP,
@@ -343,7 +344,7 @@ class WindowsAutomationHandler(BaseAutomationHandler):
         flags = self._MOUSE_UP[button]
         px, py = win32api.GetCursorPos()
         if button in _HELD_BUTTONS:
-            _HELD_BUTTONS.discard(button)
+            _HELD_BUTTONS.remove(button)
         return self._send_mouse_checked(flags, px, py)
 
     # P0: try/finally ensures mouse-up on cancel
@@ -391,10 +392,10 @@ class WindowsAutomationHandler(BaseAutomationHandler):
     async def drag_to(self, x: int, y: int, button="left", duration=0.5) -> Dict[str, Any]:
         duration = max(0.05, min(float(duration), 10.0))
         start = win32api.GetCursorPos()
-        if button not in self._MOUSE_DOWN:
-            return {"success": False, "error": f"Unsupported button: {button!r}. Use left/right/middle."}
-        flags_down = self._MOUSE_DOWN[button]
-        flags_up = self._MOUSE_UP[button]
+        flags_down = {"left": MOUSEEVENTF_LEFTDOWN, "right": MOUSEEVENTF_RIGHTDOWN,
+                      "middle": MOUSEEVENTF_MIDDLEDOWN}.get(button, MOUSEEVENTF_LEFTDOWN)
+        flags_up = {"left": MOUSEEVENTF_LEFTUP, "right": MOUSEEVENTF_RIGHTUP,
+                    "middle": MOUSEEVENTF_MIDDLEUP}.get(button, MOUSEEVENTF_LEFTUP)
 
         down = self._send_mouse_checked(flags_down, start[0], start[1])
         if not down["success"]:
@@ -427,16 +428,12 @@ class WindowsAutomationHandler(BaseAutomationHandler):
 
     # ── Keyboard (P0: physical resolver + hotkey fail-closed) ──────────
 
-    _HELD_KEYS: set = set()  # P1: set for duplicate prevention
-
     async def key_down(self, key: str) -> Dict[str, Any]:
         """Hold a physical key down. Use computer_type for text input."""
         vk = _resolve_physical_key(key)
         if vk >= 0:
-            result = _send_input_checked(_make_key_input(vk, KEYEVENTF_KEYDOWN))
-            if result["success"]:
-                _HELD_KEYS.add(vk)
-            return result
+            _HELD_KEYS.append(vk)
+            return _send_input_checked(_make_key_input(vk, KEYEVENTF_KEYDOWN))
         return {
             "success": False,
             "error": f"Unknown physical key: '{key}'. "
@@ -447,10 +444,9 @@ class WindowsAutomationHandler(BaseAutomationHandler):
         """Release a physical key. Use computer_type for text input."""
         vk = _resolve_physical_key(key)
         if vk >= 0:
-            result = _send_input_checked(_make_key_input(vk, KEYEVENTF_KEYUP))
-            if result["success"]:
-                _HELD_KEYS.discard(vk)
-            return result
+            if vk in _HELD_KEYS:
+                _HELD_KEYS.remove(vk)
+            return _send_input_checked(_make_key_input(vk, KEYEVENTF_KEYUP))
         return {
             "success": False,
             "error": f"Unknown physical key: '{key}'. "
@@ -479,23 +475,28 @@ class WindowsAutomationHandler(BaseAutomationHandler):
         return {"success": ok, "requested": requested, "inserted": inserted}
 
     async def press_key(self, key: str) -> Dict[str, Any]:
-        """Press and release a physical key. Guaranteed release on cancel.
-        
-        Physical keys only — use computer_type for text."""
+        """Press and release a physical key. Guaranteed release on cancel."""
         vk = _resolve_physical_key(key)
-        if vk < 0:
-            return {
-                "success": False,
-                "error": f"Unknown physical key: {key!r}. Use computer_type for text."
-            }
-        down = _send_input_checked(_make_key_input(vk, KEYEVENTF_KEYDOWN))
-        if not down["success"]:
-            return {"success": False, "down": down, "error": "Key down failed"}
-        try:
-            await asyncio.sleep(0.02)
-        finally:
-            up = _send_input_checked(_make_key_input(vk, KEYEVENTF_KEYUP))
-        return {"success": down["success"] and up["success"], "down": down, "up": up}
+        if vk >= 0:
+            down = _send_input_checked(_make_key_input(vk, KEYEVENTF_KEYDOWN))
+            if not down["success"]:
+                return {"success": False, "down": down, "error": "Key down failed"}
+            up = None
+            try:
+                await asyncio.sleep(0.02)
+            finally:
+                up = _send_input_checked(_make_key_input(vk, KEYEVENTF_KEYUP))
+            return {"success": down["success"] and up["success"], "down": down, "up": up}
+        if len(key) == 1:
+            units = _utf16_units(key)
+            # Send all down+up pairs in one batch for atomicity
+            inputs = []
+            for u in units:
+                inputs.append(_make_key_input(0, KEYEVENTF_UNICODE))          # down
+                inputs.append(_make_key_input(0, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP))  # up
+            result = _send_input_checked(*inputs)
+            return result
+        return {"success": False, "error": f"Unknown physical key: '{key}'. Use computer_type for text."}
 
     # P0: hotkey fail-closed + SendInput checks + try/finally
     async def hotkey(self, keys: List[str]) -> Dict[str, Any]:
@@ -546,13 +547,12 @@ class WindowsAutomationHandler(BaseAutomationHandler):
 
     async def release_input_state(self) -> Dict[str, Any]:
         results = []
-        # Release tracked held keys
+        # Release all tracked held keys
         for vk in list(_HELD_KEYS):
             r = _send_input_checked(_make_key_input(vk, KEYEVENTF_KEYUP))
             results.append(r)
-            if r["success"]:
-                _HELD_KEYS.discard(vk)
             await asyncio.sleep(0.005)
+        _HELD_KEYS.clear()
 
         # Release modifier keys
         for vk in [0x10, 0x11, 0x12, 0x5B, 0x5C]:
@@ -560,7 +560,7 @@ class WindowsAutomationHandler(BaseAutomationHandler):
             results.append(r)
             await asyncio.sleep(0.005)
 
-        # Release tracked mouse buttons
+        # Release mouse buttons
         px, py = win32api.GetCursorPos()
         for btn in list(_HELD_BUTTONS):
             flags = {"left": MOUSEEVENTF_LEFTUP, "right": MOUSEEVENTF_RIGHTUP,
@@ -568,8 +568,7 @@ class WindowsAutomationHandler(BaseAutomationHandler):
             if flags:
                 r = self._send_mouse_checked(flags, px, py)
                 results.append(r)
-                if r["success"]:
-                    _HELD_BUTTONS.discard(btn)
+        _HELD_BUTTONS.clear()
 
         # Also release all three buttons regardless
         for flags in [MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_MIDDLEUP]:
@@ -1141,22 +1140,11 @@ class WindowsFileHandler(BaseFileHandler):
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    MAX_READ_BYTES = 10_000_000
-
     async def read_bytes(self, path: str, offset=0, length=None) -> Dict[str, Any]:
-        """Read bytes with bounds enforcement. length=None defaults to MAX_READ_BYTES."""
-        if offset < 0:
-            return {"success": False, "error": "offset must be non-negative"}
-        if length is not None and not (0 <= length <= self.MAX_READ_BYTES):
-            return {
-                "success": False,
-                "error": f"length must be 0–{self.MAX_READ_BYTES}, got {length}"
-            }
-        read_len = self.MAX_READ_BYTES if length is None else length
         def _read():
             with open(path, "rb") as f:
                 f.seek(offset)
-                return base64.b64encode(f.read(read_len)).decode()
+                return base64.b64encode(f.read(length or 10_000_000)).decode()
         try:
             return {"success": True, "data_base64": await asyncio.to_thread(_read)}
         except Exception as e:
@@ -1225,13 +1213,8 @@ class WindowsFileHandler(BaseFileHandler):
             return {"success": False, "error": str(e)}
 
     async def move_file(self, src: str, dst: str) -> Dict[str, Any]:
-        """Move a regular file only — directories must use copy + delete."""
-        def _move():
-            if os.path.isdir(src):
-                raise IsADirectoryError(f"move_file accepts regular files only: {src}")
-            os.rename(src, dst)
         try:
-            await asyncio.to_thread(_move)
+            await asyncio.to_thread(os.rename, src, dst)
             return {"success": True}
         except Exception as e:
             return {"success": False, "error": str(e)}

@@ -468,9 +468,6 @@ def create_server() -> FastMCP:
         button: str = "left", duration: float = 0.5,
         frame_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Drag from start to end. With frame_id: coordinates refer to that screenshot."""
-        if button not in ("left", "right", "middle"):
-            return {"success": False, "error": f"Unsupported button: {button!r}. Use left/right/middle."}
         s_start_x, s_start_y = _resolve_coords(start_x, start_y, frame_id)
         s_end_x, s_end_y = _resolve_coords(end_x, end_y, frame_id)
         async with _PROCESS_INPUT_LOCK:
@@ -736,8 +733,7 @@ def create_server() -> FastMCP:
     @_tool(destructiveHint=True)
     @require_capability("toggle_ui_element")
     async def computer_toggle_ui_element(element_id: str) -> Dict[str, Any]:
-        async with _PROCESS_INPUT_LOCK:
-            return await acc.toggle_ui_element(element_id)
+        return await acc.toggle_ui_element(element_id)
 
     @_tool(destructiveHint=True)
     @require_capability("select_ui_element")
@@ -748,14 +744,12 @@ def create_server() -> FastMCP:
     @_tool(destructiveHint=True)
     @require_capability("expand_ui_element")
     async def computer_expand_ui_element(element_id: str) -> Dict[str, Any]:
-        async with _PROCESS_INPUT_LOCK:
-            return await acc.expand_ui_element(element_id)
+        return await acc.expand_ui_element(element_id)
 
     @_tool(destructiveHint=True)
     @require_capability("scroll_ui_element_into_view")
     async def computer_scroll_ui_element_into_view(element_id: str) -> Dict[str, Any]:
-        async with _PROCESS_INPUT_LOCK:
-            return await acc.scroll_ui_element_into_view(element_id)
+        return await acc.scroll_ui_element_into_view(element_id)
 
     @_tool(readOnlyHint=True, idempotentHint=True)
     @require_capability("wait_for_ui_element")
@@ -838,7 +832,7 @@ def create_server() -> FastMCP:
     @_tool(destructiveHint=True)
     @require_capability("move_file")
     async def computer_move_file(src: str, dst: str) -> Dict[str, Any]:
-        safe_src = _path_policy.resolve(src, destructive=True)
+        safe_src = _path_policy.resolve(src)
         safe_dst = _path_policy.resolve(dst)
         return await f.move_file(str(safe_src), str(safe_dst))
 
