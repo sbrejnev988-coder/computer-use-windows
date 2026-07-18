@@ -175,12 +175,10 @@ class RemoteComputerServer:
                     params.get("scroll_x", 0), params.get("scroll_y", 0)
                 ),
                 "mouse_down": lambda: a.mouse_down(
-                    *self._required_xy(params) if ("x" in params and "y" in params) else (None, None),
-                    params.get("button", "left")
+                    params.get("x"), params.get("y"), params.get("button", "left")
                 ),
                 "mouse_up": lambda: a.mouse_up(
-                    *self._required_xy(params) if ("x" in params and "y" in params) else (None, None),
-                    params.get("button", "left")
+                    params.get("x"), params.get("y"), params.get("button", "left")
                 ),
                 "type": lambda: a.type_text(params["text"]),
                 "press_key": lambda: a.press_key(params["key"]),
@@ -222,7 +220,7 @@ class RemoteComputerServer:
                 "find_element": lambda: acc.find_element(
                     params.get("role"), params.get("title")
                 ),
-                "get_ui_tree": lambda: acc.get_ui_tree(max(1, min(int(params.get("max_depth", 5)), 10))),
+                "get_ui_tree": lambda: acc.get_ui_tree(params.get("max_depth", 5)),
                 "find_ui_elements": lambda: acc.find_ui_elements(
                     params.get("control_type"), params.get("name"),
                     params.get("automation_id"), params.get("class_name"),

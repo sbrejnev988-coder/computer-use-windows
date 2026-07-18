@@ -286,18 +286,8 @@ class WindowsAutomationHandler(BaseAutomationHandler):
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    MAX_CAPTURE_DIM = 16_384   # Max width/height for capture requests
-    MAX_CAPTURE_PIXELS = 64_000_000  # Max total pixels (~8K)
-
     @require_unlocked_desktop
     async def screenshot_region(self, x: int, y: int, w: int, h: int) -> Dict[str, Any]:
-        # Validate dimensions before capture (protects MCP + remote)
-        if w <= 0 or h <= 0:
-            return {"success": False, "error": "width and height must be positive"}
-        if w > self.MAX_CAPTURE_DIM or h > self.MAX_CAPTURE_DIM:
-            return {"success": False, "error": f"width/height must be <= {self.MAX_CAPTURE_DIM}"}
-        if w * h > self.MAX_CAPTURE_PIXELS:
-            return {"success": False, "error": f"total pixels must be <= {self.MAX_CAPTURE_PIXELS}"}
         def _grab():
             img = ImageGrab.grab(bbox=(x, y, x + w, y + h), all_screens=True)
             buf = BytesIO(); img.save(buf, format="PNG")
@@ -664,57 +654,55 @@ class WindowsAutomationHandler(BaseAutomationHandler):
 
     MAX_COMMAND_OUTPUT = 1_000_000  # 1 MB per stream
 
-    MAX_COMMAND_OUTPUT = 1_000_000  # 1 MB per stream
-
     async def run_command(self, command: str) -> Dict[str, Any]:
-        """Run shell command with concurrent streaming + global timeout."""
+        """Run shell command with streaming I/O — prevents memory exhaustion.
+        
+        Output is read in chunks up to MAX_COMMAND_OUTPUT per stream.
+        Process is killed on timeout, output limit, or completion.
+        """
         try:
             proc = await asyncio.create_subprocess_shell(
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            # Concurrent readers — prevents backpressure deadlock
-            async def _read_limited(stream):
-                chunks = []
-                total = 0
-                while total < self.MAX_COMMAND_OUTPUT:
-                    chunk = await stream.read(65536)
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                    total += len(chunk)
-                return b"".join(chunks)
+            try:
+                # Stream read to avoid loading gigabytes into memory
+                async def _read_stream(stream, max_bytes):
+                    chunks = []
+                    total = 0
+                    while total < max_bytes:
+                        try:
+                            chunk = await asyncio.wait_for(
+                                stream.read(65536), timeout=30.0
+                            )
+                        except asyncio.TimeoutError:
+                            break
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        total += len(chunk)
+                    return b"".join(chunks), total
 
-            async def _run_with_timeout():
-                stdout_task = asyncio.create_task(_read_limited(proc.stdout))
-                stderr_task = asyncio.create_task(_read_limited(proc.stderr))
-                wait_task = asyncio.create_task(proc.wait())
+                stdout_data, _ = await _read_stream(proc.stdout, self.MAX_COMMAND_OUTPUT)
+                stderr_data, _ = await _read_stream(proc.stderr, self.MAX_COMMAND_OUTPUT)
+
                 try:
-                    done, pending = await asyncio.wait(
-                        [stdout_task, stderr_task, wait_task],
-                        timeout=30.0,
-                        return_when=asyncio.ALL_COMPLETED,
-                    )
-                    for task in pending:
-                        task.cancel()
-                    stdout = stdout_task.result() if stdout_task in done else b""
-                    stderr = stderr_task.result() if stderr_task in done else b""
-                    if wait_task not in done:
-                        proc.kill()
-                        await proc.wait()
-                    return {
-                        "success": proc.returncode == 0 if wait_task in done else False,
-                        "exit_code": proc.returncode if wait_task in done else -1,
-                        "stdout": stdout.decode("utf-8", errors="replace"),
-                        "stderr": stderr.decode("utf-8", errors="replace"),
-                    }
+                    await asyncio.wait_for(proc.wait(), timeout=5.0)
                 except asyncio.TimeoutError:
                     proc.kill()
                     await proc.wait()
-                    return {"success": False, "error": "Command timed out (30s)"}
 
-            return await _run_with_timeout()
+                return {
+                    "success": proc.returncode == 0,
+                    "exit_code": proc.returncode,
+                    "stdout": stdout_data.decode("utf-8", errors="replace"),
+                    "stderr": stderr_data.decode("utf-8", errors="replace"),
+                }
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                return {"success": False, "error": "Command timed out (30s)"}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -725,12 +713,6 @@ class WindowsAutomationHandler(BaseAutomationHandler):
             return {"success": True, "pid": proc.pid}
         except Exception as e:
             return {"success": False, "error": str(e)}
-
-    async def run_desktop_action(self, operation):
-        """Wrapper: check desktop unlocked, then execute under input lock."""
-        if self.is_desktop_locked():
-            return {"success": False, "error": "Interactive desktop is locked"}
-        return await operation()
 
     # ── Windows ───────────────────────────────────────────────────────
 
@@ -1043,13 +1025,9 @@ class WindowsAccessibilityHandler(BaseAccessibilityHandler):
             return results
         return {"elements": await asyncio.to_thread(_find)}
 
-    MAX_UIA_DEPTH = 10
-    MAX_UIA_NODES = 5_000
-
     async def get_ui_tree(self, max_depth: int = 5) -> Dict[str, Any]:
         if not _HAS_UIA:
             return {"success": False, "error": "uiautomation not installed"}
-        max_depth = max(1, min(int(max_depth), self.MAX_UIA_DEPTH))
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(_UIA_EXECUTOR, self._build_tree_sync, max_depth)
         return {"success": True, "tree": result}

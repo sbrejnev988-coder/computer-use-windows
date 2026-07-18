@@ -341,6 +341,12 @@ def _resolve_coords(
 # PS: single process-wide input lock (shared across remote + local)
 _PROCESS_INPUT_LOCK = asyncio.Lock()
 
+async def _require_interactive_desktop(automation) -> Optional[Dict[str, Any]]:
+    """Check desktop is not locked before destructive/interactive actions."""
+    if automation.is_desktop_locked():
+        return {"success": False, "error": "Interactive desktop is locked"}
+    return None
+
 
 _server: Optional[FastMCP] = None
 _handlers: Optional[Dict[str, Any]] = None
@@ -401,6 +407,12 @@ def create_server() -> FastMCP:
     async def computer_screenshot_region(
         x: int, y: int, width: int, height: int
     ) -> ToolResult:
+        if width <= 0 or height <= 0:
+            raise ValueError("width and height must be positive")
+        if width > MAX_CAPTURE_DIM or height > MAX_CAPTURE_DIM:
+            raise ValueError(f"width/height must be <= {MAX_CAPTURE_DIM}")
+        if width * height > MAX_CAPTURE_PIXELS:
+            raise ValueError(f"total pixels must be <= {MAX_CAPTURE_PIXELS}")
         result = await a.screenshot_region(x, y, width, height)
         return _screenshot_to_result(result, "region")
 
@@ -438,14 +450,13 @@ def create_server() -> FastMCP:
         if button not in ("left", "right", "middle"):
             return {"success": False, "error": f"Unsupported button: '{button}'. Use left/right/middle."}
         sx, sy = _resolve_coords(x, y, frame_id)
-        async def _op():
+        async with _PROCESS_INPUT_LOCK:
             if button == "left":
                 return await a.left_click(sx, sy)
             elif button == "right":
                 return await a.right_click(sx, sy)
             else:
                 return await a.middle_click(sx, sy)
-        return await a.run_desktop_action(_op)
 
     @_tool(destructiveHint=True)
     @require_capability("double_click")
@@ -558,7 +569,7 @@ def create_server() -> FastMCP:
             return await a.key_up(key)
 
     @_tool(destructiveHint=True)
-    @require_capability("release_input_state")
+    @require_capability("mouse_up")
     async def computer_release_input_state() -> Dict[str, Any]:
         """Emergency: release all modifier keys (Shift/Ctrl/Alt/Win) + mouse buttons."""
         async with _PROCESS_INPUT_LOCK:
