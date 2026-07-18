@@ -341,13 +341,6 @@ def _resolve_coords(
 # PS: single process-wide input lock (shared across remote + local)
 _PROCESS_INPUT_LOCK = asyncio.Lock()
 
-async def _require_interactive_desktop(automation) -> Optional[Dict[str, Any]]:
-    """Check desktop is not locked before destructive/interactive actions."""
-    if automation.is_desktop_locked():
-        return {"success": False, "error": "Interactive desktop is locked"}
-    return None
-
-
 _server: Optional[FastMCP] = None
 _handlers: Optional[Dict[str, Any]] = None
 
@@ -407,12 +400,6 @@ def create_server() -> FastMCP:
     async def computer_screenshot_region(
         x: int, y: int, width: int, height: int
     ) -> ToolResult:
-        if width <= 0 or height <= 0:
-            raise ValueError("width and height must be positive")
-        if width > MAX_CAPTURE_DIM or height > MAX_CAPTURE_DIM:
-            raise ValueError(f"width/height must be <= {MAX_CAPTURE_DIM}")
-        if width * height > MAX_CAPTURE_PIXELS:
-            raise ValueError(f"total pixels must be <= {MAX_CAPTURE_PIXELS}")
         result = await a.screenshot_region(x, y, width, height)
         return _screenshot_to_result(result, "region")
 
@@ -445,8 +432,6 @@ def create_server() -> FastMCP:
         With frame_id: coordinates refer to that screenshot.
         Without frame_id: coordinates are virtual-desktop pixels.
         """
-        locked = await _require_interactive_desktop(a)
-        if locked: return locked
         if button not in ("left", "right", "middle"):
             return {"success": False, "error": f"Unsupported button: '{button}'. Use left/right/middle."}
         sx, sy = _resolve_coords(x, y, frame_id)
@@ -721,7 +706,6 @@ def create_server() -> FastMCP:
     @_tool(readOnlyHint=True)
     @require_capability("get_ui_tree")
     async def computer_get_ui_tree(max_depth: int = 5) -> Dict[str, Any]:
-        max_depth = max(1, min(max_depth, 10))
         return await acc.get_ui_tree(max_depth)
 
     @_tool(readOnlyHint=True)

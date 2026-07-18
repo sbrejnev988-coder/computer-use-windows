@@ -70,7 +70,6 @@ if sys.platform == "win32":
 
     INPUT_MOUSE = 0; INPUT_KEYBOARD = 1
     KEYEVENTF_KEYDOWN = 0x0000; KEYEVENTF_KEYUP = 0x0002
-    KEYEVENTF_EXTENDEDKEY = 0x0001
     KEYEVENTF_UNICODE = 0x0004
     MOUSEEVENTF_MOVE = 0x0001; MOUSEEVENTF_LEFTDOWN = 0x0002
     MOUSEEVENTF_LEFTUP = 0x0004; MOUSEEVENTF_RIGHTDOWN = 0x0008
@@ -172,26 +171,6 @@ _SPECIAL_KEYS = {
     "volume_mute": 0xAD, "volume_down": 0xAE, "volume_up": 0xAF,
 }
 
-# Extended keys requiring KEYEVENTF_EXTENDEDKEY flag
-_EXTENDED_VKS = {
-    0x21,  # Page Up
-    0x22,  # Page Down
-    0x23,  # End
-    0x24,  # Home
-    0x25,  # Left
-    0x26,  # Up
-    0x27,  # Right
-    0x28,  # Down
-    0x2D,  # Insert
-    0x2E,  # Delete
-    0x2C,  # Print Screen
-    0x5B,  # Left Win
-    0x5C,  # Right Win
-    0x5D,  # Apps
-    0xA3,  # Right Ctrl
-    0xA5,  # Right Alt
-}
-
 # P0: tracked held keys for emergency release
 _HELD_BUTTONS: set = set()  # tracked mouse buttons for emergency release
 
@@ -227,23 +206,16 @@ def _send_key_event(vk: int, flags: int) -> int:
     return _send_input(inp)
 
 
-def _make_unicode_input(code_unit: int, is_up: bool = False) -> INPUT:
-    """Build a single Unicode key event as INPUT struct."""
+def _send_unicode_key(code_unit: int, is_up: bool = False) -> int:
     inp = INPUT()
     inp.type = INPUT_KEYBOARD
     inp.union.ki.wVk = 0; inp.union.ki.wScan = code_unit
     inp.union.ki.dwFlags = KEYEVENTF_UNICODE | (KEYEVENTF_KEYUP if is_up else 0)
     inp.union.ki.time = 0; inp.union.ki.dwExtraInfo = None
-    return inp
-
-def _send_unicode_key(code_unit: int, is_up: bool = False) -> int:
-    inp = _make_unicode_input(code_unit, is_up)
     return _send_input(inp)
 
 
 def _make_key_input(vk: int, flags: int) -> INPUT:
-    if vk in _EXTENDED_VKS:
-        flags |= KEYEVENTF_EXTENDEDKEY
     inp = INPUT()
     inp.type = INPUT_KEYBOARD
     inp.union.ki.wVk = vk; inp.union.ki.wScan = 0
@@ -487,27 +459,25 @@ class WindowsAutomationHandler(BaseAutomationHandler):
         }
 
     async def type_text(self, text: str) -> Dict[str, Any]:
-        """Type text via Unicode input — atomic per-character, layout-independent.
+        """Type text via Unicode input — layout-independent, handles all scripts.
         
-        Each character's down+up events are sent as a single SendInput batch.
-        This prevents cancel-mid-character (no stuck keys) and avoids the
-        async sleep gap between down and up.
+        Physical-key resolver is NOT used for text — all characters go through
+        KEYEVENTF_UNICODE. This ensures correct input regardless of active
+        keyboard layout (e.g. 'hello' stays 'hello' even with Russian layout).
         """
-        results = []
+        requested = 0
+        inserted = 0
         for char in text:
-            units = _utf16_units(char)
-            # Build all down+up events for this character atomically
-            events = []
-            for unit in units:
-                events.append(_make_unicode_input(unit, is_up=False))
-            for unit in units:
-                events.append(_make_unicode_input(unit, is_up=True))
-            result = _send_input_checked(*events)
-            results.append(result)
-            if not result["success"]:
-                return {"success": False, "error": "Type text failed mid-string", "results": results}
+            for unit in _utf16_units(char):
+                requested += 1
+                inserted += _send_unicode_key(unit, is_up=False)
+            await asyncio.sleep(0.002)
+            for unit in _utf16_units(char):
+                requested += 1
+                inserted += _send_unicode_key(unit, is_up=True)
             await asyncio.sleep(0.005)
-        return {"success": True, "results": results}
+        ok = inserted == requested
+        return {"success": ok, "requested": requested, "inserted": inserted}
 
     async def press_key(self, key: str) -> Dict[str, Any]:
         """Press and release a physical key. Guaranteed release on cancel.
@@ -522,15 +492,10 @@ class WindowsAutomationHandler(BaseAutomationHandler):
         down = _send_input_checked(_make_key_input(vk, KEYEVENTF_KEYDOWN))
         if not down["success"]:
             return {"success": False, "down": down, "error": "Key down failed"}
-        if down["success"]:
-            _HELD_KEYS.add(vk)
-        up = None
         try:
             await asyncio.sleep(0.02)
         finally:
             up = _send_input_checked(_make_key_input(vk, KEYEVENTF_KEYUP))
-            if up["success"]:
-                _HELD_KEYS.discard(vk)
         return {"success": down["success"] and up["success"], "down": down, "up": up}
 
     # P0: hotkey fail-closed + SendInput checks + try/finally
@@ -561,7 +526,6 @@ class WindowsAutomationHandler(BaseAutomationHandler):
                 if not result["success"]:
                     break
                 pressed.append(vk)
-                _HELD_KEYS.add(vk)
                 await asyncio.sleep(0.01)
             else:
                 await asyncio.sleep(0.05)
@@ -570,8 +534,6 @@ class WindowsAutomationHandler(BaseAutomationHandler):
             for vk in reversed(pressed):
                 result = _send_input_checked(_make_key_input(vk, KEYEVENTF_KEYUP))
                 up_results.append(result)
-                if result["success"]:
-                    _HELD_KEYS.discard(vk)
                 await asyncio.sleep(0.01)
 
         release_ok = all(r["success"] for r in up_results) if up_results else True
@@ -652,57 +614,18 @@ class WindowsAutomationHandler(BaseAutomationHandler):
 
     # ── Shell ─────────────────────────────────────────────────────────
 
-    MAX_COMMAND_OUTPUT = 1_000_000  # 1 MB per stream
-
     async def run_command(self, command: str) -> Dict[str, Any]:
-        """Run shell command with streaming I/O — prevents memory exhaustion.
-        
-        Output is read in chunks up to MAX_COMMAND_OUTPUT per stream.
-        Process is killed on timeout, output limit, or completion.
-        """
         try:
             proc = await asyncio.create_subprocess_shell(
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+                command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             try:
-                # Stream read to avoid loading gigabytes into memory
-                async def _read_stream(stream, max_bytes):
-                    chunks = []
-                    total = 0
-                    while total < max_bytes:
-                        try:
-                            chunk = await asyncio.wait_for(
-                                stream.read(65536), timeout=30.0
-                            )
-                        except asyncio.TimeoutError:
-                            break
-                        if not chunk:
-                            break
-                        chunks.append(chunk)
-                        total += len(chunk)
-                    return b"".join(chunks), total
-
-                stdout_data, _ = await _read_stream(proc.stdout, self.MAX_COMMAND_OUTPUT)
-                stderr_data, _ = await _read_stream(proc.stderr, self.MAX_COMMAND_OUTPUT)
-
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    proc.kill()
-                    await proc.wait()
-
-                return {
-                    "success": proc.returncode == 0,
-                    "exit_code": proc.returncode,
-                    "stdout": stdout_data.decode("utf-8", errors="replace"),
-                    "stderr": stderr_data.decode("utf-8", errors="replace"),
-                }
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
             except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
+                proc.kill(); await proc.wait()
                 return {"success": False, "error": "Command timed out (30s)"}
+            return {"success": proc.returncode == 0, "exit_code": proc.returncode,
+                    "stdout": stdout.decode("utf-8", errors="replace")[:1_000_000],
+                    "stderr": stderr.decode("utf-8", errors="replace")[:1_000_000]}
         except Exception as e:
             return {"success": False, "error": str(e)}
 

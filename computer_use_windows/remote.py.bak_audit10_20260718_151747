@@ -128,13 +128,6 @@ class RemoteComputerServer:
         "doctor": "system_info",
     }
 
-    @staticmethod
-    def _required_xy(params: Dict[str, Any]) -> tuple:
-        """Extract required x,y coords — fail-closed."""
-        if "x" not in params or "y" not in params:
-            raise ValueError("x and y are required for this operation")
-        return int(params["x"]), int(params["y"])
-
     async def handle_message(
         self, session: RemoteComputerSession, msg: Dict[str, Any]
     ) -> Dict[str, Any]:
@@ -161,10 +154,10 @@ class RemoteComputerServer:
                 "screenshot_window": lambda: a.screenshot_window(params.get("window_id")),
                 "get_screen_size": a.get_screen_size,
                 "get_cursor_position": a.get_cursor_position,
-                "click": lambda: a.left_click(*self._required_xy(params)),
-                "right_click": lambda: a.right_click(*self._required_xy(params)),
-                "middle_click": lambda: a.middle_click(*self._required_xy(params)),
-                "double_click": lambda: a.double_click(*self._required_xy(params)),
+                "click": lambda: a.left_click(params.get("x"), params.get("y")),
+                "right_click": lambda: a.right_click(params.get("x"), params.get("y")),
+                "middle_click": lambda: a.middle_click(params.get("x"), params.get("y")),
+                "double_click": lambda: a.double_click(params.get("x"), params.get("y")),
                 "move": lambda: a.move_cursor(params["x"], params["y"]),
                 "drag": lambda: a.drag_to(
                     params["x"], params["y"],
@@ -255,7 +248,7 @@ class RemoteComputerServer:
                 "delete_file": lambda: f.delete_file(str(path_policy.resolve(params["path"], destructive=True))),
                 "delete_dir": lambda: f.delete_dir(str(path_policy.resolve(params["path"], destructive=True))),
                 "get_file_size": lambda: f.get_file_size(str(path_policy.resolve(params["path"]))),
-                "move_file": lambda: f.move_file(str(path_policy.resolve(params["src"], destructive=True)), str(path_policy.resolve(params["dst"]))),
+                "move_file": lambda: f.move_file(str(path_policy.resolve(params["src"])), str(path_policy.resolve(params["dst"]))),
                 "copy_file": lambda: f.copy_file(str(path_policy.resolve(params["src"])), str(path_policy.resolve(params["dst"]))),
                 "release_input_state": a.release_input_state,
                 "doctor": a.system_info,
