@@ -172,7 +172,7 @@ _SPECIAL_KEYS = {
 }
 
 # P0: tracked held keys for emergency release
-_HELD_BUTTONS: set = set()  # tracked mouse buttons for emergency release
+_HELD_KEYS_GLOBAL: set = set()  # used in release_input_state
 
 def _resolve_physical_key(key: str) -> int:
     """Resolve a physical key name → virtual key code.
@@ -342,10 +342,9 @@ class WindowsAutomationHandler(BaseAutomationHandler):
             self._set_cursor_pos(x, y)
         flags = self._MOUSE_UP[button]
         px, py = win32api.GetCursorPos()
-        result = self._send_mouse_checked(flags, px, py)
-        if result["success"]:
+        if button in _HELD_BUTTONS:
             _HELD_BUTTONS.discard(button)
-        return result
+        return self._send_mouse_checked(flags, px, py)
 
     # P0: try/finally ensures mouse-up on cancel
     async def _click_with_finally(self, down_flag: int, up_flag: int, x: int, y: int) -> Dict[str, Any]:

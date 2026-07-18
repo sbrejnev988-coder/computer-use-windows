@@ -22,7 +22,6 @@ from mcp.types import TextContent
 import json
 from PIL import Image as PILImage  # BL#1: was missing
 
-from .. import __version__
 from ..handlers import (
     WindowsAutomationHandler, WindowsAccessibilityHandler, WindowsFileHandler,
     WindowsSystemHandler,
@@ -377,7 +376,7 @@ def create_server() -> FastMCP:
     mcp = FastMCP(
         "Computer Use Windows",
         instructions="Windows desktop control via MCP — mouse, keyboard, UIA, files, system",
-        version=__version__,
+        version="2.1.4",
     )
 
     # ─── Helper: tool registration with annotations ────────────────────
